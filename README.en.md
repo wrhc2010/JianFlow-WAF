@@ -30,10 +30,21 @@ cp .env.example .env
 Set `ADMIN_PASSWORD`, `SESSION_SECRET`, and `POSTGRES_PASSWORD` in `.env` (use a random PostgreSQL password with no URL-reserved characters). Set `UPSTREAM_URL` to your test application. Add `OPENROUTER_API_KEY` only if you want AI classification.
 
 ```bash
-docker compose up -d --pull always --no-build
+docker compose up -d --build
 ```
 
-This pulls the published API and Web images from GHCR. Use `docker compose up -d --build` to build locally instead. Open the console at `http://localhost:3000`, send test traffic to `http://localhost:8080`, or check the API at `http://localhost:4000/api/v1/health`. The console and WAF listen on LAN by default; the API binds to the host loopback, and PostgreSQL is not published. Do not expose the console on an untrusted network without an HTTPS reverse proxy and access controls.
+Build the API and Web images locally with `docker compose up -d --build`. Open the console at `http://localhost:3000`, send test traffic to `http://localhost:8080`, or check the API at `http://localhost:4000/api/v1/health`. The console and WAF listen on LAN by default; the API binds to the host loopback, and PostgreSQL is not published. Do not expose the console on an untrusted network without an HTTPS reverse proxy and access controls.
+
+To skip the build, download both public image archives from the [v0.1.0 release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.1.0) into the repository directory:
+
+```bash
+docker load -i jianflow-waf-api-v0.1.0.tar.gz
+docker load -i jianflow-waf-web-v0.1.0.tar.gz
+# Add IMAGE_TAG=v0.1.0 to .env
+docker compose up -d --no-build --pull never
+```
+
+The images are also stored at `ghcr.io/wrhc2010/jianflow-waf-api` and `ghcr.io/wrhc2010/jianflow-waf-web`. Anonymous pulls require the package owner to change both GHCR packages to Public.
 
 The default container upstream is `http://host.docker.internal:9000`. For a service on the same Compose network, use its service name, such as `UPSTREAM_URL=http://app:8080`.
 

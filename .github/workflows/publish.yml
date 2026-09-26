@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -44,3 +44,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+      - name: Attach loadable image to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/jianflow-waf-${{ matrix.service }}:${{ github.ref_name }}
+          ASSET: jianflow-waf-${{ matrix.service }}-${{ github.ref_name }}.tar.gz
+        run: |
+          docker pull "$IMAGE"
+          docker save "$IMAGE" | gzip -1 > "$ASSET"
+          gh release upload "${{ github.ref_name }}" "$ASSET" --repo "${{ github.repository }}" --clobber

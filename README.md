@@ -21,7 +21,7 @@
 
 需要 Docker Compose v2；也可以用 Node.js 22 本地启动。先准备一个自己的测试上游服务，别直接接生产流量。
 
-### Docker Compose（拉取镜像）
+### Docker Compose
 
 ```bash
 git clone https://github.com/wrhc2010/JianFlow-WAF.git
@@ -32,10 +32,21 @@ cp .env.example .env
 编辑 `.env`：填写 `ADMIN_PASSWORD`、`SESSION_SECRET` 和 `POSTGRES_PASSWORD`（PostgreSQL 密码请用不含 URL 特殊字符的随机字符串）；把 `UPSTREAM_URL` 改成测试服务地址。需要 AI 判断时再填写 `OPENROUTER_API_KEY`，不需要则在控制台选择“传统规则”模式。
 
 ```bash
-docker compose up -d --pull always --no-build
+docker compose up -d --build
 ```
 
-此命令拉取 GHCR 的 API 和 Web 镜像。想从源码构建，把最后一行换成 `docker compose up -d --build`。默认管理后台在 `http://localhost:3000`，WAF HTTP 入口在 `http://localhost:8080`，健康检查在 `http://localhost:4000/api/v1/health`。Compose 的管理后台和 WAF 端口默认监听局域网，API 仅绑定本机，数据库不对主机开放；在不可信网络中请先通过可信的 HTTPS 反向代理保护管理后台，并限制访问来源。
+此命令从源码构建 API 和 Web 镜像。默认管理后台在 `http://localhost:3000`，WAF HTTP 入口在 `http://localhost:8080`，健康检查在 `http://localhost:4000/api/v1/health`。Compose 的管理后台和 WAF 端口默认监听局域网，API 仅绑定本机，数据库不对主机开放；在不可信网络中请先通过可信的 HTTPS 反向代理保护管理后台，并限制访问来源。
+
+不想构建？[v0.1.0 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.1.0) 附有公开的 API/Web 镜像压缩包，下载后在仓库目录执行：
+
+```bash
+docker load -i jianflow-waf-api-v0.1.0.tar.gz
+docker load -i jianflow-waf-web-v0.1.0.tar.gz
+# 在 .env 中另加 IMAGE_TAG=v0.1.0
+docker compose up -d --no-build --pull never
+```
+
+GHCR 同步保存了 `ghcr.io/wrhc2010/jianflow-waf-api` 和 `ghcr.io/wrhc2010/jianflow-waf-web`；在包所有者将两个包的可见性设为 Public 之前，匿名 `docker pull` 不可用。
 
 Compose 默认上游是 `http://host.docker.internal:9000`，用于连接宿主机上的测试服务。如果上游也在同一 Compose 网络，改用服务名，例如 `UPSTREAM_URL=http://app:8080`。上游地址填错时，放行的请求会得到 502。
 
