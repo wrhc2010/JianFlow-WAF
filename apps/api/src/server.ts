@@ -35,7 +35,7 @@ app.post<{ Body: { username?: string; password?: string } }>("/api/v1/auth/login
   reply.setCookie("jev_session", token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: config.nodeEnv === "production",
+    secure: request.headers["x-forwarded-proto"] === "https",
     path: "/",
     maxAge: 8 * 60 * 60
   });

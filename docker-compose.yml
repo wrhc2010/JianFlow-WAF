@@ -4,9 +4,7 @@ services:
     environment:
       POSTGRES_DB: jevwaf
       POSTGRES_USER: jevwaf
-      POSTGRES_PASSWORD: jevwaf
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - jevwaf-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -16,6 +14,7 @@ services:
       retries: 10
 
   api:
+    image: ghcr.io/wrhc2010/jianflow-waf-api:${IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: apps/api/Dockerfile
@@ -28,19 +27,21 @@ services:
       HTTPS_PORT: 8443
       TLS_KEY_PATH: ${TLS_KEY_PATH:-}
       TLS_CERT_PATH: ${TLS_CERT_PATH:-}
-      DATABASE_URL: postgres://jevwaf:jevwaf@postgres:5432/jevwaf
+      DATABASE_URL: postgres://jevwaf:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/jevwaf
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-typesafe/jev-1.13}
       ADMIN_USER: ${ADMIN_USER:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
-      SESSION_SECRET: ${SESSION_SECRET:-change-me-session-secret}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
       UPSTREAM_URL: ${UPSTREAM_URL:-http://host.docker.internal:9000}
       AI_TIMEOUT_MS: ${AI_TIMEOUT_MS:-2000}
       AI_BODY_LIMIT: ${AI_BODY_LIMIT:-32768}
     ports:
-      - "4000:4000"
+      - "127.0.0.1:4000:4000"
       - "8080:8080"
       - "8443:8443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ${TLS_CERT_DIR:-./certs}:/app/certs:ro
     depends_on:
@@ -48,11 +49,12 @@ services:
         condition: service_healthy
 
   web:
+    image: ghcr.io/wrhc2010/jianflow-waf-web:${IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: apps/web/Dockerfile
     ports:
-      - "3000:80"
+      - "${CONSOLE_BIND:-0.0.0.0}:3000:80"
     depends_on:
       - api
 
