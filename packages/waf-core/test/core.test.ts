@@ -1,0 +1,70 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { STRENGTH_THRESHOLDS, buildAiState, evaluateRules, thresholdFor } from "../src/index.js";
+
+test("maps protection strengths to monotonic thresholds", () => {
+  assert.equal(STRENGTH_THRESHOLDS.low, 0.5);
+  assert.equal(STRENGTH_THRESHOLDS.extreme, 0.95);
+  assert.ok(STRENGTH_THRESHOLDS.low < STRENGTH_THRESHOLDS.medium);
+});
+
+test("clamps custom thresholds", () => {
+  assert.equal(thresholdFor({ strength: "custom", customThreshold: 2 }), 1);
+  assert.equal(thresholdFor({ strength: "custom", customThreshold: -1 }), 0);
+});
+
+test("redacts credential headers from AI state", () => {
+  const state = buildAiState({
+    method: "GET",
+    path: "/admin",
+    query: "",
+    headers: { authorization: "secret", host: "example.test" }
+  }, 1000);
+  assert.match(state, /REDACTED/);
+  assert.doesNotMatch(state, /secret/);
+});
+
+test("redacts sensitive query and nested JSON fields before contacting Jev", () => {
+  const state = buildAiState({
+    method: "POST",
+    path: "/login",
+    query: "?q=select&access_token=private-query",
+    headers: { "content-type": "application/json", "x-api-key": "private-header" },
+    body: JSON.stringify({ username: "admin", nested: { password: "private-body" } })
+  }, 1000);
+  assert.doesNotMatch(state, /private-query|private-header|private-body/);
+  assert.match(state, /select/);
+  assert.match(state, /admin/);
+});
+
+test("omits unknown body formats from the AI state", () => {
+  const state = buildAiState({
+    method: "POST",
+    path: "/upload",
+    query: "",
+    headers: { "content-type": "text/plain" },
+    body: "sensitive plain text"
+  }, 1000);
+  assert.doesNotMatch(state, /sensitive plain text/);
+});
+
+test("evaluates traditional rules", () => {
+  const matches = evaluateRules({
+    method: "GET",
+    path: "/search",
+    query: "q=union+select+password+from+users",
+    headers: {}
+  }, [{
+    id: "test",
+    name: "test",
+    source: "test",
+    category: "SQL",
+    severity: "high",
+    target: "query",
+    operator: "regex",
+    pattern: "union\\s+select",
+    action: "block",
+    enabled: true
+  }]);
+  assert.equal(matches[0]?.ruleId, "test");
+});
