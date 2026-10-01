@@ -1,6 +1,6 @@
 {
   "name": "@jev-waf/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -9,5 +9,9 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "ipaddr.js": "^2.5.0",
+    "re2-wasm": "^1.0.2"
   }
 }

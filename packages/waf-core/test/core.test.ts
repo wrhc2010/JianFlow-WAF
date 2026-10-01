@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { STRENGTH_THRESHOLDS, buildAiState, evaluateRules, thresholdFor } from "../src/index.js";
+import { BUILTIN_RULES, STRENGTH_THRESHOLDS, buildAiState, evaluateRules, thresholdFor } from "../src/index.js";
 
 test("maps protection strengths to monotonic thresholds", () => {
-  assert.equal(STRENGTH_THRESHOLDS.low, 0.5);
-  assert.equal(STRENGTH_THRESHOLDS.extreme, 0.95);
+  assert.equal(STRENGTH_THRESHOLDS.veryLow, 0.1);
+  assert.equal(STRENGTH_THRESHOLDS.low, 0.3);
+  assert.equal(STRENGTH_THRESHOLDS.medium, 0.5);
+  assert.equal(STRENGTH_THRESHOLDS.high, 0.7);
+  assert.equal(STRENGTH_THRESHOLDS.extreme, 0.9);
   assert.ok(STRENGTH_THRESHOLDS.low < STRENGTH_THRESHOLDS.medium);
 });
 
@@ -37,7 +40,7 @@ test("redacts sensitive query and nested JSON fields before contacting Jev", () 
   assert.match(state, /admin/);
 });
 
-test("omits unknown body formats from the AI state", () => {
+test("includes inspectable text body formats in the AI state", () => {
   const state = buildAiState({
     method: "POST",
     path: "/upload",
@@ -45,7 +48,28 @@ test("omits unknown body formats from the AI state", () => {
     headers: { "content-type": "text/plain" },
     body: "sensitive plain text"
   }, 1000);
-  assert.doesNotMatch(state, /sensitive plain text/);
+  assert.match(state, /sensitive plain text/);
+});
+
+test("normalizes Unicode and repeated URL encoding for traditional rules", () => {
+  const matches = evaluateRules({
+    method: "GET",
+    path: "/search",
+    query: "q=%25%25%EF%BC%9Cscript%EF%BC%9E",
+    headers: {}
+  }, [{
+    id: "unicode-xss",
+    name: "unicode xss",
+    source: "test",
+    category: "XSS",
+    severity: "high",
+    target: "query",
+    operator: "regex",
+    pattern: "(<script>)",
+    action: "block",
+    enabled: true
+  }]);
+  assert.equal(matches[0]?.ruleId, "unicode-xss");
 });
 
 test("evaluates traditional rules", () => {
@@ -67,4 +91,14 @@ test("evaluates traditional rules", () => {
     enabled: true
   }]);
   assert.equal(matches[0]?.ruleId, "test");
+});
+
+test("inspects Host without treating ordinary local addressing as an attack", () => {
+  const matches = evaluateRules({
+    method: "GET",
+    path: "/health",
+    query: "",
+    headers: { host: "127.0.0.1:8088" }
+  }, BUILTIN_RULES);
+  assert.equal(matches.length, 0);
 });

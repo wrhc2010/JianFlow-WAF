@@ -13,13 +13,14 @@ export async function classifyWithJev(state: string, model: string, timeoutMs: n
       noul: 0,
       latencyMs: Math.round(performance.now() - started),
       available: false,
-      error: "OPENROUTER_API_KEY 未配置"
+      error: "JEV_API_KEY/OPENROUTER_API_KEY 未配置"
     };
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch("https://openrouter.ai/api/alpha/decisions", {
+    const baseUrl = config.jevBaseUrl.replace(/\/+$/, "").replace(/\/api\/(?:alpha|v1)\/decisions$/, "");
+    const response = await fetch(`${baseUrl}/api/alpha/decisions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.openRouterKey}`,

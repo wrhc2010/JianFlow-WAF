@@ -1,9 +1,55 @@
 import type { ProtectionMode, ProtectionStrength } from "@jev-waf/core";
+import { loadEnvFile } from "node:process";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { loadSessionSecret } from "./secrets.js";
 
-function numberEnv(name: string, fallback: number): number {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) ? value : fallback;
+try {
+  loadEnvFile(fileURLToPath(new URL("../../../.env", import.meta.url)));
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 }
+
+function numberEnv(name: string, fallback: number, min = 1, max = Number.MAX_SAFE_INTEGER): number {
+  if (!process.env[name]?.trim()) return fallback;
+  const value = Number(process.env[name]);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+export type DatabaseUrlOptions = {
+  host: string;
+  port: string;
+  user: string;
+  password: string;
+  database: string;
+};
+
+export function buildDatabaseUrl(options: DatabaseUrlOptions): string {
+  const url = new URL("postgresql://localhost");
+  url.username = options.user;
+  url.password = options.password;
+  url.hostname = options.host;
+  url.port = options.port;
+  url.pathname = `/${options.database}`;
+  return url.toString();
+}
+
+const dataDir = process.env.DATA_DIR?.trim() || fileURLToPath(new URL("../../../data", import.meta.url));
+function databaseUrlFromSecret(): string {
+  const passwordFile = process.env.POSTGRES_PASSWORD_FILE?.trim() || "";
+  const password = process.env.POSTGRES_PASSWORD?.trim()
+    || (passwordFile && existsSync(passwordFile) ? readFileSync(passwordFile, "utf8").trim() : "");
+  const host = process.env.POSTGRES_HOST?.trim() || "";
+  if (!password || !host) return "";
+  return buildDatabaseUrl({
+    host,
+    port: process.env.POSTGRES_PORT?.trim() || "5432",
+    user: process.env.POSTGRES_USER?.trim() || "jevwaf",
+    password,
+    database: process.env.POSTGRES_DB?.trim() || "jevwaf"
+  });
+}
+const databaseUrl = process.env.DATABASE_URL?.trim() || databaseUrlFromSecret();
 
 export const config = {
   nodeEnv: process.env.NODE_ENV ?? "development",
@@ -14,16 +60,24 @@ export const config = {
   httpsPort: numberEnv("HTTPS_PORT", 8443),
   tlsKeyPath: process.env.TLS_KEY_PATH ?? "",
   tlsCertPath: process.env.TLS_CERT_PATH ?? "",
-  databaseUrl: process.env.DATABASE_URL ?? "",
-  openRouterKey: process.env.OPENROUTER_API_KEY ?? "",
-  openRouterModel: process.env.OPENROUTER_MODEL ?? "typesafe/jev-1.13",
+  databaseUrl,
+  environmentApiKey: process.env.JEV_API_KEY ?? process.env.OPENROUTER_API_KEY ?? "",
+  openRouterKey: process.env.JEV_API_KEY ?? process.env.OPENROUTER_API_KEY ?? "",
+  openRouterModel: process.env.JEV_MODEL ?? process.env.OPENROUTER_MODEL ?? "typesafe/jev-1.13",
+  jevBaseUrl: process.env.JEV_BASE_URL ?? process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai",
   adminUser: process.env.ADMIN_USER ?? "admin",
-  adminPassword: process.env.ADMIN_PASSWORD ?? "change-me-now",
-  sessionSecret: process.env.SESSION_SECRET ?? "development-only-secret",
+  adminPassword: process.env.ADMIN_PASSWORD ?? "",
+  sessionSecret: loadSessionSecret(dataDir, process.env.SESSION_SECRET),
+  sessionCookieSecure: process.env.SESSION_COOKIE_SECURE === "true",
   upstreamUrl: process.env.UPSTREAM_URL ?? "http://127.0.0.1:9000",
   aiTimeoutMs: numberEnv("AI_TIMEOUT_MS", 2000),
   aiBodyLimit: numberEnv("AI_BODY_LIMIT", 32768),
+  maxRequestBodyBytes: numberEnv("MAX_REQUEST_BODY_BYTES", 10 * 1024 * 1024),
   logRetentionDays: numberEnv("LOG_RETENTION_DAYS", 30),
+  dataDir,
+  geoIpDatabasePath: process.env.GEOIP_DATABASE_PATH ?? "",
+  geoIpAsnDatabasePath: process.env.GEOIP_ASN_DATABASE_PATH ?? "",
+  trustedProxyCidrs: (process.env.TRUSTED_PROXY_CIDRS ?? "").split(",").map((value) => value.trim()).filter(Boolean),
   defaultMode: (process.env.DEFAULT_MODE as ProtectionMode | undefined) ?? "hybrid",
   defaultStrength: (process.env.DEFAULT_STRENGTH as ProtectionStrength | undefined) ?? "medium"
 };

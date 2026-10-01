@@ -9,4 +9,8 @@ work
 outputs
 certs
 coverage
+data
+geoip
+**/*.mmdb
+**/session-secret
 *.log

@@ -1,6 +1,6 @@
 {
   "name": "@jev-waf/api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,13 +13,19 @@
   },
   "dependencies": {
     "@fastify/cookie": "^10.0.1",
+    "@fastify/rate-limit": "^10.3.0",
     "@fastify/websocket": "^11.0.2",
-    "@jev-waf/core": "0.1.0",
+    "@jev-waf/core": "0.2.0",
+    "busboy": "^1.6.0",
+    "fast-xml-parser": "^5.11.2",
     "fastify": "^5.2.1",
     "http-proxy": "^1.18.1",
+    "jsonc-parser": "^3.3.1",
+    "maxmind": "^5.0.7",
     "pg": "^8.13.1"
   },
   "devDependencies": {
+    "@types/busboy": "^1.5.4",
     "@types/http-proxy": "^1.17.15",
     "@types/pg": "^8.11.10"
   }

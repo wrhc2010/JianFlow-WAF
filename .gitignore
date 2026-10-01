@@ -6,6 +6,8 @@ outputs/
 .env.*
 !.env.example
 coverage/
+data/
+geoip/*.mmdb
 *.log
 certs/*.key
 certs/*.pem
