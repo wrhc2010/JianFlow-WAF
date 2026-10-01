@@ -16,6 +16,7 @@ services:
       - postgres_password
 
   api:
+    image: ghcr.io/wrhc2010/jianflow-waf-api:${IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: apps/api/Dockerfile
@@ -72,6 +73,7 @@ services:
         condition: service_healthy
 
   web:
+    image: ghcr.io/wrhc2010/jianflow-waf-web:${IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: apps/web/Dockerfile

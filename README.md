@@ -2,6 +2,13 @@
 
 鉴流是一个面向自托管场景的 Web 应用防火墙。它把本地规则、Jev AI 判断和可追溯的请求事件放在同一条防护链路里，适合需要自己掌握数据、策略和部署方式的团队。
 
+[![License: MIT](https://img.shields.io/github/license/wrhc2010/JianFlow-WAF)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/wrhc2010/JianFlow-WAF)](https://github.com/wrhc2010/JianFlow-WAF/releases)
+[![CI](https://github.com/wrhc2010/JianFlow-WAF/actions/workflows/ci.yml/badge.svg)](https://github.com/wrhc2010/JianFlow-WAF/actions/workflows/ci.yml)
+[![Node.js 22](https://img.shields.io/badge/Node.js-22-339933)](package.json)
+
+**中文** | [English](README.en.md)
+
 项目提供三种防护模式：
 
 - **传统规则**：只使用本地规则引擎，行为稳定、延迟低。
@@ -22,6 +29,12 @@
 - 支持 JSON 和常见 ModSecurity `SecRule` 规则导入，提供预览、校验、冲突处理和原子写入。
 - WebUI 提供初始化、登录、规则库、Jev 配置、事件中心、2D 地图和 3D 攻击地球。
 - GeoIP 使用操作方提供的 MaxMind City/ASN MMDB 文件，不依赖在线 IP 查询。
+
+## 看一眼
+
+![鉴流控制台的实际运行截图](docs/images/console.png)
+
+登录后可以查看请求事件、切换防护模式、测试规则、修改上游地址，并在攻击大屏中查看 2D/3D 统计视图。
 
 ## 本地开发
 
@@ -171,3 +184,7 @@ packages/waf-core  规则引擎、请求规范化和安全正则
 ```
 
 规则包和离线地图的授权边界见 [`packages/waf-core/RULES.md`](packages/waf-core/RULES.md)。
+
+## 许可证
+
+项目代码与文档采用 MIT 许可证。规则包和离线地图的授权边界见 [`packages/waf-core/RULES.md`](packages/waf-core/RULES.md)；第三方依赖仍以各自许可证为准。
