@@ -36,54 +36,106 @@
 
 登录后可以查看请求事件、切换防护模式、测试规则、修改上游地址，并在攻击大屏中查看 2D/3D 统计视图。
 
-## 本地开发
+## 在 Linux 上部署
 
-需要 Node.js 22 或更高版本。
+以下步骤面向 Linux 服务器，命令使用 Bash，配置对应 `v0.2.0`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
+
+需要 Git、curl、OpenSSL，以及已安装并运行的 Docker Engine 和 Docker Compose v2。使用容器部署不需要在宿主机安装 Node.js。
+
+### 获取代码和准备配置
 
 ```bash
-npm install
+git clone https://github.com/wrhc2010/JianFlow-WAF.git
+cd JianFlow-WAF
 cp .env.example .env
+chmod 600 .env
+mkdir -p secrets certs geoip
+chmod 700 secrets
+openssl rand -hex 32 > secrets/postgres_password
+chmod 644 secrets/postgres_password
+```
+
+密码文件需要能被容器中的 PostgreSQL 用户读取，所以使用 `644`；宿主机上的 `secrets` 目录使用 `700`，限制其他普通用户访问。上述密码生成命令只在首次部署时执行，已有数据库不要重新生成密码。
+
+编辑 `.env`，把上游和 GeoIP 路径改为容器可访问的地址：
+
+```dotenv
+UPSTREAM_URL=http://host.docker.internal:9000
+GEOIP_DIR=./geoip
+GEOIP_DATABASE_PATH=/app/geoip/GeoIP2-City.mmdb
+GEOIP_ASN_DATABASE_PATH=/app/geoip/GeoIP2-ASN.mmdb
+```
+
+`host.docker.internal` 已在 Compose 中映射到宿主机网关。Linux 上的上游服务必须监听容器可访问的宿主机地址，不能只监听 `127.0.0.1`；同时用访问控制限制上游入口。如果上游也在同一个容器网络中，使用服务名，例如 `UPSTREAM_URL=http://app:8080`。**容器内的 `127.0.0.1` 指向容器自身，不是宿主机。**
+
+`ADMIN_PASSWORD` 和 `SESSION_SECRET` 可以留空。首次打开后台时设置管理员密码；会话密钥会自动生成并保存在持久化数据目录中。Jev 和 GeoIP 可以稍后配置。
+
+### 启动和检查
+
+```bash
+docker compose config --quiet
+docker compose up -d --build
+docker compose ps
+curl -fsS http://127.0.0.1:4000/api/v1/health
+```
+
+等待服务健康检查通过后，健康接口应返回包含 `"ok": true` 的 JSON。在浏览器中打开 `http://服务器地址:3000` 完成初始化。
+
+| 入口 | 端口 | 用途 |
+| --- | ---: | --- |
+| 管理后台 | 3000 | 初始化、规则和事件管理 |
+| 管理 API | 4000 | 健康检查和管理接口 |
+| WAF HTTP | 8080 | 被保护服务的 HTTP 入口 |
+| WAF HTTPS | 8443 | 配置证书后使用 |
+
+当前 Compose 将上述端口发布到宿主机所有接口，PostgreSQL 不对宿主机开放。请限制管理后台和 API 的访问来源；公网管理入口应放在可信的 HTTPS 反向代理后，不要直接开放 `3000` 和 `4000`。
+
+Compose 使用文件型 Docker secret 提供 PostgreSQL 密码。可以通过 `POSTGRES_PASSWORD_FILE_SOURCE` 指向已有密码文件；显式设置 `DATABASE_URL` 时，API 会优先使用它。PostgreSQL 数据和 API 数据目录由命名卷持久化，GeoIP 文件从宿主机 `GEOIP_DIR` 只读挂载。
+
+### 使用发布镜像
+
+不想在服务器构建时，可以从 [v0.2.0 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.0) 下载 API 和 Web 镜像压缩包。先按上面的步骤准备配置和密码文件，再导入镜像：
+
+```bash
+docker load -i jianflow-waf-api-v0.2.0.tar.gz
+docker load -i jianflow-waf-web-v0.2.0.tar.gz
+IMAGE_TAG=v0.2.0 docker compose up -d --no-build --pull never
+```
+
+`--pull never` 不会下载缺失的镜像；如果本机还没有 PostgreSQL 镜像，先运行 `docker pull postgres:16-alpine`。
+
+### 日志和日常维护
+
+```bash
+docker compose logs --tail=100 api web postgres
+docker compose restart api web
+docker compose down
+```
+
+`docker compose down` 只停止并移除容器和网络，数据卷仍保留。不要在需要保留数据时加 `-v`。备份时同时保存 PostgreSQL 数据、API 数据卷、`.env` 和数据库密码文件；丢失或更换会话密钥会导致已有 API key 密文无法解密。
+
+## Linux 本地开发
+
+需要 Node.js 22 或更高版本和 npm。在仓库根目录执行：
+
+```bash
+npm ci
+cp .env.example .env
+chmod 600 .env
 npm run dev
 ```
 
-启动后可以访问：
+如果已有 `.env`，不要再次复制覆盖。`npm run dev` 会先编译规则引擎，再启动 API 和前端开发服务。
 
 - 管理后台：`http://127.0.0.1:3000`
 - API：`http://127.0.0.1:4000`
 - WAF HTTP 入口：`http://127.0.0.1:8080`
 
-没有设置 `DATABASE_URL` 时，API 会使用 `DATA_DIR` 下的 SQLite 文件保存设置、规则和事件，适合本地试运行。首次打开 WebUI 只需要设置管理员密码，Jev key、模型和 GeoIP 都可以之后再配置。
-
-## Docker Compose
-
-```bash
-cp .env.example .env
-mkdir -p secrets
-printf 'replace-with-a-long-random-password\n' > secrets/postgres_password
-docker compose up -d --build
-```
-
-Windows PowerShell 可以这样创建密码文件：
-
-```powershell
-New-Item -ItemType Directory -Force secrets | Out-Null
-Set-Content -NoNewline secrets/postgres_password 'replace-with-a-long-random-password'
-docker compose up -d --build
-```
-
-服务地址：
-
-- 管理后台：`http://服务器地址:3000`
-- API：`http://服务器地址:4000`
-- WAF：`http://服务器地址:8080`
-
-Compose 使用 Docker secret 提供 PostgreSQL 密码，不把默认数据库口令写进 compose 文件。也可以通过 `POSTGRES_PASSWORD_FILE_SOURCE` 指向现有的 secret 文件；如果显式设置 `DATABASE_URL`，API 会优先使用它。
-
-默认上游地址是 `http://host.docker.internal:9000`。如果被保护服务也运行在 Compose 网络中，把 `UPSTREAM_URL` 改成对应的服务名，例如 `http://app:8080`。Compose 会持久化 PostgreSQL 数据和 API 数据目录；GeoIP 文件通过 `GEOIP_DIR` 挂载。
+本地直接运行时，宿主机上游可以使用 `UPSTREAM_URL=http://127.0.0.1:9000`。没有配置 PostgreSQL 时，设置、规则和事件会保存到 `DATA_DIR` 下的 SQLite 文件；首次初始化只需要设置管理员密码。
 
 ## HTTPS 和 WebSocket
 
-将证书目录挂载到 `TLS_CERT_DIR`，并在 `.env` 中设置容器内路径：
+在 Linux 服务器上把证书和私钥放入 `./certs`，确保容器可读取，并在 `.env` 中设置：
 
 ```dotenv
 TLS_CERT_DIR=./certs
@@ -91,11 +143,13 @@ TLS_KEY_PATH=/app/certs/tls.key
 TLS_CERT_PATH=/app/certs/tls.crt
 ```
 
-HTTPS 入口是 `8443`。WebSocket 握手也会进入 WAF 决策管线，确认升级成功后再透传连接。
+执行 `docker compose up -d --build` 应用配置。HTTPS WAF 入口是 `8443`，这不会为 `3000` 管理后台自动启用 HTTPS。后台通过 HTTPS 反向代理访问时，设置 `SESSION_COOKIE_SECURE=true`。
+
+WebSocket 握手也会进入 WAF 决策管线，确认升级成功后再透传连接；建立连接后的消息不做内容检查。
 
 ## Jev 配置
 
-Jev 可以通过环境变量配置，也可以在 WebUI 的“防护策略”中配置。WebUI 保存的 key 会使用 `SESSION_SECRET` 加密后写入数据库；接口只返回是否已配置以及 key 的来源，不会回显明文。
+Jev 可以通过环境变量配置，也可以在 WebUI 的“防护策略”中配置。WebUI 保存的 key 会使用会话密钥（显式设置的 `SESSION_SECRET`，或数据目录中的自动生成密钥）加密后写入数据库；接口只返回是否已配置以及 key 的来源，不会回显明文。
 
 ```dotenv
 JEV_API_KEY=your-jev-key
@@ -141,7 +195,7 @@ GeoIP 使用本地 MMDB 文件：
 - City：`GeoIP2-City.mmdb`
 - ASN：`GeoIP2-ASN.mmdb`
 
-可以把文件放在 `DATA_DIR/geoip`，也可以通过 `GEOIP_DATABASE_PATH` 和 `GEOIP_ASN_DATABASE_PATH` 分别指定路径。没有数据库时，地图仍然可用，但来源会显示为“未知地区”。2D 地图轮廓来自随前端依赖分发的离线 Natural Earth-derived `world-atlas` 数据。
+Docker 部署时，把文件放在宿主机的 `./geoip`，并使用上文的 `/app/geoip/...` 容器内路径。本地直接运行时，可以放在 `DATA_DIR/geoip`，也可以通过 `GEOIP_DATABASE_PATH` 和 `GEOIP_ASN_DATABASE_PATH` 指定其他路径。没有数据库时，来源会显示为“未知地区”，但地图仍然可以打开。2D 地图轮廓来自随前端依赖分发的离线 Natural Earth-derived `world-atlas` 数据。
 
 ## 防护边界
 
@@ -165,13 +219,13 @@ npm run build
 npm test
 ```
 
-传统规则测试：
+完成初始化后，可以直接向 WAF 入口发送一条规则测试请求：
 
 ```bash
-curl -X POST http://127.0.0.1:4000/api/v1/rules/test \
-  -H 'content-type: application/json' \
-  -d '{"method":"GET","path":"/search","query":"?q=union+select+password+from+users","headers":{}}'
+curl -i 'http://127.0.0.1:8080/search?q=union+select+password+from+users'
 ```
+
+默认混合模式下，预期返回 `403`，不需要上游或 Jev 在线。普通请求返回 `502` 时，先检查 `UPSTREAM_URL` 和上游服务的监听地址；服务启动异常可查看 `docker compose logs --tail=100 api postgres`。
 
 管理 API 需要先通过 `/api/v1/auth/login` 获取 HttpOnly 会话 Cookie。正式版验证还覆盖 PostgreSQL 迁移、重启持久化、压缩请求、请求头攻击、可信代理 IP、规则导入原子性、2D/3D 地图和 WebGL 回退。
 
