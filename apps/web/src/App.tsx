@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { geoGraticule10, geoNaturalEarth1, geoPath } from "d3-geo";
 import { feature } from "topojson-client";
 import worldAtlas from "world-atlas/countries-110m.json";
@@ -344,9 +344,12 @@ function Console({ onLogout }: { onLogout: () => void }) {
     if (dirtySections[section] && !window.confirm("当前页面有未保存修改，确定离开吗？")) return;
     setSection(nextSection);
   };
-  const setDirty = (key: string, dirty: boolean) => {
-    setDirtySections((current) => ({ ...current, [key]: dirty }));
-  };
+  const setSitesDirty = useCallback((dirty: boolean) => {
+    setDirtySections((current) => current.sites === dirty ? current : { ...current, sites: dirty });
+  }, []);
+  const setSettingsDirty = useCallback((dirty: boolean) => {
+    setDirtySections((current) => current.settings === dirty ? current : { ...current, settings: dirty });
+  }, []);
   return (
     <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
@@ -374,8 +377,8 @@ function Console({ onLogout }: { onLogout: () => void }) {
           {section === "map" && <MapDashboard />}
           {section === "events" && <Events />}
           {section === "rules" && <Rules />}
-          {section === "sites" && <Sites onDirtyChange={(dirty) => setDirty("sites", dirty)} />}
-          {section === "settings" && <SettingsPanel onDirtyChange={(dirty) => setDirty("settings", dirty)} />}
+          {section === "sites" && <Sites onDirtyChange={setSitesDirty} />}
+          {section === "settings" && <SettingsPanel onDirtyChange={setSettingsDirty} />}
         </div>
       </main>
     </div>
@@ -1016,6 +1019,11 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
   }, [dirty, onDirtyChange]);
 
   const hasJevKey = draft.apiKeyConfigured && !clearApiKey || Boolean(apiKey.trim());
+  useEffect(() => {
+    if (!hasJevKey) {
+      setDraft((current) => current.mode === "traditional" ? current : { ...current, mode: "traditional" });
+    }
+  }, [hasJevKey]);
   const updateDraft = (patch: Partial<Settings>) => setDraft((current) => ({ ...current, ...patch }));
   const cancel = () => {
     if (serverSettings) setDraft(serverSettings);

@@ -211,3 +211,33 @@ test("imports whole packs atomically, honors conflicts and preserves options acr
   assert.deepEqual(rule.transforms, ["lowercase"]);
   assert.equal(evaluateRules({ method: "GET", path: "/", query: "", headers: { "x-token": "DANGER" } }, [rule]).length, 1);
 });
+
+test("removing the final Jev key immediately persists traditional mode for every site", async () => {
+  config.databaseUrl = "";
+  config.dataDir = fixtureDir();
+  config.adminPassword = "";
+  config.environmentApiKey = "";
+  config.openRouterKey = "";
+  const store = new Store();
+  await store.init();
+  try {
+    await store.updateSettings({ apiKey: "test-key", mode: "hybrid" });
+    const site = await store.saveSite({
+      name: "AI site", listenPort: 8081, upstreamUrl: "http://127.0.0.1:9101",
+      mode: "ai", enabled: true
+    });
+    assert.equal(site.mode, "ai");
+    await store.updateSettings({ apiKey: null });
+    assert.equal(store.getSiteByPort(8081)?.mode, "traditional");
+    assert.ok(store.listSites().every((entry) => entry.mode === "traditional"));
+    const restarted = new Store();
+    try {
+      await restarted.init();
+      assert.deepEqual(restarted.listSites(), store.listSites());
+    } finally {
+      await restarted.close();
+    }
+  } finally {
+    await store.close();
+  }
+});

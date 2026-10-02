@@ -234,9 +234,9 @@ export class Store {
     await this.pool.query(
       `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
        VALUES ('default', $1, $2, $3, $4, TRUE)
-       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name,
+       ON CONFLICT (id) DO UPDATE SET
        listen_port = EXCLUDED.listen_port, upstream_url = EXCLUDED.upstream_url,
-       mode = EXCLUDED.mode, enabled = TRUE`,
+       mode = EXCLUDED.mode`,
       ["默认站点", config.proxyPort, this.settings.upstreamUrl, this.settings.mode]
     );
 
@@ -353,31 +353,48 @@ export class Store {
       : config.openRouterKey;
     candidate.mode = effectiveApiKey ? candidate.mode : "traditional";
     validateSettings(candidate);
-    if (this.pool) {
-      await this.pool.query(
-        `UPDATE settings SET mode = $1, strength = $2, custom_threshold = $3,
-         model = $4, jev_base_url = $5, ai_timeout_ms = $6, ai_body_limit = $7,
-         upstream_url = $8,
-         api_key_ciphertext = CASE WHEN $9::boolean THEN $10::text ELSE api_key_ciphertext END,
-         updated_at = NOW() WHERE id = 1`,
-        [
-          candidate.mode, candidate.strength, candidate.customThreshold, candidate.model,
-          candidate.jevBaseUrl, candidate.aiTimeoutMs, candidate.aiBodyLimit, candidate.upstreamUrl,
-          apiKey !== undefined,
-          apiKeyCiphertext ?? null
-        ]
-      );
+    const sites = this.listSites().map((site) => ({
+      ...site,
+      upstreamUrl: site.id === "default" ? candidate.upstreamUrl : site.upstreamUrl,
+      mode: effectiveProtectionMode(site.id === "default" ? candidate.mode : site.mode, Boolean(effectiveApiKey))
+    }));
+    const client = this.pool ? await this.pool.connect() : null;
+    try {
+      if (client) {
+        await client.query("BEGIN");
+        await client.query(
+          `UPDATE settings SET mode = $1, strength = $2, custom_threshold = $3,
+           model = $4, jev_base_url = $5, ai_timeout_ms = $6, ai_body_limit = $7,
+           upstream_url = $8,
+           api_key_ciphertext = CASE WHEN $9::boolean THEN $10::text ELSE api_key_ciphertext END,
+           updated_at = NOW() WHERE id = 1`,
+          [
+            candidate.mode, candidate.strength, candidate.customThreshold, candidate.model,
+            candidate.jevBaseUrl, candidate.aiTimeoutMs, candidate.aiBodyLimit, candidate.upstreamUrl,
+            apiKey !== undefined,
+            apiKeyCiphertext ?? null
+          ]
+        );
+        for (const site of sites) {
+          await client.query(
+            `UPDATE sites SET upstream_url = $1, mode = $2 WHERE id = $3`,
+            [site.upstreamUrl, site.mode, site.id]
+          );
+        }
+        await client.query("COMMIT");
+      } else {
+        this.local!.writeState({ ...this.snapshot(), settings: candidate, apiKeyCiphertext, sites });
+      }
+    } catch (error) {
+      if (client) await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client?.release();
     }
     this.settings = candidate;
     this.apiKeyCiphertext = apiKeyCiphertext;
     this.syncRuntimeSettings();
-    const defaultSite = this.sites.get("default");
-    if (defaultSite) {
-      defaultSite.upstreamUrl = this.settings.upstreamUrl;
-      defaultSite.mode = this.settings.mode;
-    }
-    if (this.pool) await this.persistDefaultSite();
-    else this.local!.writeState(this.snapshot());
+    for (const site of sites) this.sites.set(site.id, site);
     await this.notifySitesChanged();
     return this.getSettings();
   }
@@ -415,27 +432,40 @@ export class Store {
         enabled: input.enabled,
         createdAt: current?.createdAt ?? new Date().toISOString()
       };
-      if (site.id === "default") {
-        this.settings.upstreamUrl = site.upstreamUrl;
-        this.settings.mode = site.mode;
-      }
-      if (this.pool) {
-        await this.pool.query(
-          `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, listen_port = EXCLUDED.listen_port,
-           upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled`,
-          [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled]
-        );
-        if (site.id === "default") {
-          await this.pool.query(
-            `UPDATE settings SET upstream_url = $1, mode = $2, updated_at = NOW() WHERE id = 1`,
-            [site.upstreamUrl, site.mode]
+      const settings = site.id === "default"
+        ? { ...this.settings, upstreamUrl: site.upstreamUrl, mode: site.mode }
+        : this.settings;
+      const client = this.pool ? await this.pool.connect() : null;
+      try {
+        if (client) {
+          await client.query("BEGIN");
+          await client.query(
+            `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, listen_port = EXCLUDED.listen_port,
+             upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled`,
+            [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled]
           );
+          if (site.id === "default") {
+            await client.query(
+              `UPDATE settings SET upstream_url = $1, mode = $2, updated_at = NOW() WHERE id = 1`,
+              [site.upstreamUrl, site.mode]
+            );
+          }
+          await client.query("COMMIT");
+        } else {
+          this.local!.writeState({
+            ...this.snapshot(), settings,
+            sites: [...this.sites.values()].filter((item) => item.id !== site.id).concat(site)
+          });
         }
-      } else {
-        this.local!.writeState({ ...this.snapshot(), sites: [...this.sites.values()].filter((item) => item.id !== site.id).concat(site) });
+      } catch (error) {
+        if (client) await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client?.release();
       }
+      this.settings = settings;
       this.sites.set(site.id, site);
       await this.notifySitesChanged();
       return { ...site };
@@ -842,23 +872,6 @@ export class Store {
       );
     }
     await this.pool.query(`UPDATE settings SET mode = $1 WHERE id = 1`, [this.settings.mode]);
-  }
-
-  private async persistDefaultSite(): Promise<void> {
-    const site = this.sites.get("default");
-    if (!site) return;
-    if (!this.pool) {
-      this.local!.writeState(this.snapshot());
-      return;
-    }
-    await this.pool.query(
-      `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name,
-       listen_port = EXCLUDED.listen_port, upstream_url = EXCLUDED.upstream_url,
-       mode = EXCLUDED.mode, enabled = EXCLUDED.enabled`,
-      [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled]
-    );
   }
 
   private async notifySitesChanged(): Promise<void> {

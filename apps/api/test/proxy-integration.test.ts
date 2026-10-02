@@ -6,6 +6,7 @@ import test from "node:test";
 import { gzipSync } from "node:zlib";
 import { BUILTIN_RULES, type WafDecision } from "@jev-waf/core";
 import { createProxyServer } from "../src/proxy.js";
+import { ProxyListenerManager } from "../src/proxy-manager.js";
 import type { Store } from "../src/db/store.js";
 
 async function listen(server: http.Server): Promise<number> {
@@ -187,9 +188,7 @@ test("routes enabled listener ports to their own site upstreams", { timeout: 500
   } as unknown as Store;
   const first = createProxyServer(store, 28081);
   const second = createProxyServer(store, 28082);
-  first.listen(28081, "127.0.0.1");
-  second.listen(28082, "127.0.0.1");
-  await Promise.all([once(first, "listening"), once(second, "listening")]);
+  const [firstPort, secondPort] = await Promise.all([listen(first), listen(second)]);
   t.after(() => {
     first.closeAllConnections();
     second.closeAllConnections();
@@ -207,6 +206,50 @@ test("routes enabled listener ports to their own site upstreams", { timeout: 500
     });
     request.on("error", reject);
   });
-  assert.equal(await responseFor(28081), "9101");
-  assert.equal(await responseFor(28082), "9102");
+  assert.equal(await responseFor(firstPort!), "9101");
+  assert.equal(await responseFor(secondPort!), "9102");
+});
+
+test("disabling a listener closes upgraded WebSocket connections without hanging", { timeout: 5000 }, async (t) => {
+  const upstreamSockets = new Set<import("node:stream").Duplex>();
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    upstreamSockets.add(socket);
+    socket.on("close", () => upstreamSockets.delete(socket));
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+  });
+  const upstreamPort = await listen(upstream);
+  const reservation = http.createServer();
+  const port = await listen(reservation);
+  await new Promise<void>((resolve) => reservation.close(() => resolve()));
+  let enabled = true;
+  const store = {
+    listSites: () => [{ listenPort: port, enabled }],
+    getSettings: () => ({
+      mode: "traditional", strength: "medium", customThreshold: 0.5, model: "test",
+      aiTimeoutMs: 100, aiBodyLimit: 32768, upstreamUrl: `http://127.0.0.1:${upstreamPort}`
+    }),
+    listRules: () => BUILTIN_RULES,
+    saveEvent: async () => {}
+  } as unknown as Store;
+  const manager = new ProxyListenerManager(store);
+  let socket: net.Socket | undefined;
+  t.after(async () => {
+    socket?.destroy();
+    for (const connection of upstreamSockets) connection.destroy();
+    await manager.close();
+    upstream.close();
+  });
+  await manager.sync();
+  socket = net.connect(port, "127.0.0.1");
+  socket.on("error", () => {});
+  await once(socket, "connect");
+  socket.write("GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+  assert.match(String((await once(socket, "data"))[0]), /^HTTP\/1\.1 101\b/);
+  enabled = false;
+  const result = await Promise.race([
+    manager.sync().then(() => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500))
+  ]);
+  assert.equal(result, true, "listener shutdown must not wait for a WebSocket client to disconnect");
 });

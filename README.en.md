@@ -78,10 +78,10 @@ PostgreSQL reads its password from a file-backed Docker secret. Use `POSTGRES_PA
 
 The default site always uses port `8080`. In **Sites and upstreams**, create a site, choose an unused port from the configured range, enter its upstream URL, and select its protection mode. Saving an enabled site starts its listener; disabling or deleting it removes that listener.
 
-`SITE_PORT_RANGE` is read when the deployment starts. To use another range, such as `9000-9009`, update `.env` and the Compose port mapping together, then restart:
+`SITE_PORT_RANGE` is read when the deployment starts and must include the default entry port, `8080`. To extend it to `8080-8109`, update `.env` and restart. The supplied Compose file publishes ports using this variable; update any custom port mapping as well:
 
 ```dotenv
-SITE_PORT_RANGE=9000-9009
+SITE_PORT_RANGE=8080-8109
 ```
 
 The default site still uses `PROXY_PORT`, which defaults to `8080`; a custom range must include that port.

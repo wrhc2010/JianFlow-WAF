@@ -126,3 +126,80 @@ test("real PostgreSQL migration, restart, all-history metrics and failure atomic
   assert.equal(config.openRouterKey, "environment-test-fallback");
   console.log(`Verified PostgreSQL schema: ${schema}`);
 });
+
+test("PostgreSQL preserves default edits and legacy site ports across restart and key removal", {
+  skip: !process.env.TEST_DATABASE_URL, timeout: 30000
+}, async (t) => {
+  const url = new URL(process.env.TEST_DATABASE_URL!);
+  const schema = `sites_${randomUUID().replace(/-/g, "")}`;
+  const admin = new Pool({ connectionString: url.toString() });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  url.searchParams.set("options", `-c search_path=${schema}`);
+  config.databaseUrl = url.toString();
+  config.adminPassword = "";
+  config.environmentApiKey = "";
+  config.openRouterKey = "";
+  const db = new Pool({ connectionString: config.databaseUrl });
+  const stores: Store[] = [];
+  t.after(async () => {
+    for (const store of stores) await store.close();
+    await db.end();
+    await admin.end();
+  });
+  await db.query(`
+    CREATE TABLE sites (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, upstream_url TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'hybrid', enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    INSERT INTO sites (id, name, upstream_url, mode, enabled) VALUES
+      ('default', 'Existing default', 'http://127.0.0.1:9100', 'traditional', FALSE),
+      ('legacy-one', 'Legacy one', 'http://127.0.0.1:9101', 'ai', TRUE),
+      ('legacy-two', 'Legacy two', 'http://127.0.0.1:9102', 'hybrid', FALSE);
+  `);
+  const store = new Store();
+  stores.push(store);
+  await store.init();
+  const migrated = store.listSites();
+  assert.equal(migrated.length, 3);
+  assert.equal(new Set(migrated.map((site) => site.listenPort)).size, 3);
+  assert.equal(migrated.find((site) => site.id === "default")?.listenPort, 8080);
+  assert.equal(migrated.find((site) => site.id === "default")?.name, "Existing default");
+  assert.equal(migrated.find((site) => site.id === "default")?.enabled, false);
+  assert.ok(migrated.every((site) => site.mode === "traditional"));
+  await store.saveSite({
+    ...migrated.find((site) => site.id === "default")!, name: "Edited default"
+  });
+  const defaultBefore = store.listSites().find((site) => site.id === "default")!;
+  const settingsBefore = store.getSettings();
+  await db.query(`
+    ALTER TABLE settings ADD CONSTRAINT reject_default_edit_test
+    CHECK (upstream_url <> 'http://127.0.0.1:9199')
+  `);
+  await assert.rejects(store.saveSite({ ...defaultBefore, upstreamUrl: "http://127.0.0.1:9199" }));
+  assert.deepEqual(store.getSettings(), settingsBefore);
+  assert.deepEqual(store.listSites().find((site) => site.id === "default"), defaultBefore);
+  assert.equal((await db.query("SELECT upstream_url FROM sites WHERE id = 'default'")).rows[0].upstream_url, defaultBefore.upstreamUrl);
+  await db.query("ALTER TABLE settings DROP CONSTRAINT reject_default_edit_test");
+  await store.updateSettings({ apiKey: "temporary-test-key", mode: "hybrid" });
+  await store.saveSite({ ...migrated.find((site) => site.id === "legacy-one")!, mode: "ai" });
+  const before = store.getSettings();
+  await db.query(`
+    ALTER TABLE sites ADD CONSTRAINT reject_fallback_test
+    CHECK (id <> 'legacy-one' OR mode <> 'traditional')
+  `);
+  await assert.rejects(store.updateSettings({ apiKey: null }));
+  assert.deepEqual(store.getSettings(), before);
+  assert.equal(store.getSiteByPort(migrated.find((site) => site.id === "legacy-one")!.listenPort)?.mode, "ai");
+  assert.equal((await db.query("SELECT mode FROM settings")).rows[0].mode, "hybrid");
+  await db.query("ALTER TABLE sites DROP CONSTRAINT reject_fallback_test");
+  await store.updateSettings({ apiKey: null });
+  assert.ok(store.listSites().every((site) => site.mode === "traditional"));
+  assert.ok((await db.query("SELECT mode FROM sites")).rows.every((row) => row.mode === "traditional"));
+  const restarted = new Store();
+  stores.push(restarted);
+  await restarted.init();
+  assert.deepEqual(restarted.listSites(), store.listSites());
+  assert.equal(restarted.listSites().find((site) => site.id === "default")?.name, "Edited default");
+  assert.equal(restarted.listSites().find((site) => site.id === "default")?.enabled, false);
+});
