@@ -218,9 +218,16 @@ proxy.on("proxyRes", (upstream, request) => {
   upstream.once("error", () => responseFailures.get(request)?.("上游响应传输失败"));
 });
 
-async function handleProxyRequest(store: Store, request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
-  const requestId = randomUUID();
+function settingsForPort(store: Store, listenPort?: number) {
   const settings = store.getSettings();
+  if (listenPort === undefined || typeof store.getSiteByPort !== "function") return settings;
+  const site = store.getSiteByPort(listenPort);
+  return site ? { ...settings, mode: site.mode, upstreamUrl: site.upstreamUrl } : settings;
+}
+
+async function handleProxyRequest(store: Store, request: http.IncomingMessage, response: http.ServerResponse, listenPort?: number): Promise<void> {
+  const requestId = randomUUID();
+  const settings = settingsForPort(store, listenPort);
   const wafRequest = requestOf(request);
   const saveOnce = eventSaver(store, wafRequest);
   let decision = inspectionFailure(settings.mode, requestId, "请求尚未完成检查");
@@ -280,8 +287,8 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
   }
 }
 
-async function handleUpgrade(store: Store, request: http.IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
-  const settings = store.getSettings();
+async function handleUpgrade(store: Store, request: http.IncomingMessage, socket: Duplex, head: Buffer, listenPort?: number): Promise<void> {
+  const settings = settingsForPort(store, listenPort);
   const requestId = randomUUID();
   const wafRequest = requestOf(request);
   const saveOnce = eventSaver(store, wafRequest);
@@ -352,28 +359,28 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
   }
 }
 
-function attachUpgradeHandler(server: http.Server | https.Server, store: Store): void {
+function attachUpgradeHandler(server: http.Server | https.Server, store: Store, listenPort?: number): void {
   server.requestTimeout = 30000;
   server.headersTimeout = 15000;
   server.on("upgrade", (request, socket, head) => {
-    void handleUpgrade(store, request, socket, head).catch(() => socket.destroy());
+    void handleUpgrade(store, request, socket, head, listenPort).catch(() => socket.destroy());
   });
 }
 
-export function createProxyServer(store: Store): http.Server {
+export function createProxyServer(store: Store, listenPort?: number): http.Server {
   const server = http.createServer((request, response) => {
-    void handleProxyRequest(store, request, response).catch(() => response.destroy());
+    void handleProxyRequest(store, request, response, listenPort).catch(() => response.destroy());
   });
-  attachUpgradeHandler(server, store);
+  attachUpgradeHandler(server, store, listenPort);
   return server;
 }
 
-export function createHttpsProxyServer(store: Store, keyPath: string, certPath: string): https.Server | null {
+export function createHttpsProxyServer(store: Store, keyPath: string, certPath: string, listenPort?: number): https.Server | null {
   try {
     const server = https.createServer({ key: readFileSync(keyPath), cert: readFileSync(certPath) }, (request, response) => {
-      void handleProxyRequest(store, request, response).catch(() => response.destroy());
+      void handleProxyRequest(store, request, response, listenPort).catch(() => response.destroy());
     });
-    attachUpgradeHandler(server, store);
+    attachUpgradeHandler(server, store, listenPort);
     return server;
   } catch {
     return null;

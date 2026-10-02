@@ -26,6 +26,7 @@ services:
       API_PORT: 4000
       PROXY_HOST: 0.0.0.0
       PROXY_PORT: 8080
+      SITE_PORT_RANGE: ${SITE_PORT_RANGE:-8080-8099}
       HTTPS_PORT: 8443
       TLS_KEY_PATH: ${TLS_KEY_PATH:-}
       TLS_CERT_PATH: ${TLS_CERT_PATH:-}
@@ -54,7 +55,7 @@ services:
       - postgres_password
     ports:
       - "4000:4000"
-      - "8080:8080"
+      - "${SITE_PORT_RANGE:-8080-8099}:${SITE_PORT_RANGE:-8080-8099}"
       - "8443:8443"
     volumes:
       - ${TLS_CERT_DIR:-./certs}:/app/certs:ro

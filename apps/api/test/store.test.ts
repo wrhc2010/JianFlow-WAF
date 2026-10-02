@@ -125,6 +125,71 @@ test("accepts ordinary HTTP(S) site endpoints and rejects unsafe URL forms", asy
   }
 });
 
+test("persists per-site ports, rejects collisions, protects the default site and falls back without Jev", async () => {
+  const previous = {
+    databaseUrl: config.databaseUrl,
+    dataDir: config.dataDir,
+    adminPassword: config.adminPassword,
+    environmentApiKey: config.environmentApiKey,
+    openRouterKey: config.openRouterKey,
+    sitePortRange: config.sitePortRange,
+    proxyPort: config.proxyPort
+  };
+  config.databaseUrl = "";
+  config.dataDir = fixtureDir();
+  config.adminPassword = "";
+  config.environmentApiKey = "";
+  config.openRouterKey = "";
+  const store = new Store();
+  await store.init();
+  try {
+    const created = await store.saveSite({
+      name: "Orders",
+      listenPort: 8081,
+      upstreamUrl: "http://127.0.0.1:9101",
+      mode: "hybrid",
+      enabled: true
+    });
+    assert.equal(created.listenPort, 8081);
+    assert.equal(created.mode, "traditional");
+    await assert.rejects(
+      store.saveSite({
+        name: "Collision",
+        listenPort: 8081,
+        upstreamUrl: "http://127.0.0.1:9102",
+        mode: "traditional",
+        enabled: true
+      }),
+      /已被站点/
+    );
+    await store.saveSite({
+      ...created,
+      name: "Orders edited",
+      upstreamUrl: "http://127.0.0.1:9103"
+    });
+    assert.equal(store.getSiteByPort(8081)?.upstreamUrl, "http://127.0.0.1:9103");
+    await assert.rejects(store.deleteSite("default"), /默认站点不能删除/);
+
+    const restarted = new Store();
+    await restarted.init();
+    try {
+      assert.equal(restarted.listSites().find((site) => site.id === created.id)?.listenPort, 8081);
+      assert.equal(restarted.getSiteByPort(8081)?.name, "Orders edited");
+    } finally {
+      await restarted.close();
+    }
+  } finally {
+    await store.close();
+    config.databaseUrl = previous.databaseUrl;
+    config.dataDir = previous.dataDir;
+    config.adminPassword = previous.adminPassword;
+    config.environmentApiKey = previous.environmentApiKey;
+    config.openRouterKey = previous.openRouterKey;
+    config.sitePortRange = previous.sitePortRange;
+    config.proxyPort = previous.proxyPort;
+  }
+});
+
 test("imports whole packs atomically, honors conflicts and preserves options across local restart", async (t) => {
   config.dataDir = fixtureDir();
   const store = new Store();

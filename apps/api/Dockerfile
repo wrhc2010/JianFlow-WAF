@@ -17,5 +17,5 @@ COPY --from=build /app/packages/waf-core/package.json ./packages/waf-core/packag
 COPY --from=build /app/packages/waf-core/dist ./packages/waf-core/dist
 COPY --from=build /app/apps/api/package.json ./apps/api/package.json
 COPY --from=build /app/apps/api/dist ./apps/api/dist
-EXPOSE 4000 8080 8443
+EXPOSE 4000 8080-8099 8443
 CMD ["node", "apps/api/dist/server.js"]

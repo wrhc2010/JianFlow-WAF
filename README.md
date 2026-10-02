@@ -19,8 +19,12 @@
 
 ## 这版重点
 
-`v0.2.0` 是一次从原型走向可持续试运行的升级，重点解决了请求检查不完整、统计口径不清楚和初次部署门槛高的问题：
+`v0.2.1` 在 `v0.2.0` 的基础上补齐了多站点入口和配置保存流程：
 
+- 站点按监听端口区分入口，默认可用端口为 `8080-8099`，每个端口可以指向不同上游并使用不同防护模式。
+- “防护策略”和站点表单都采用草稿 + 保存/取消，避免输入过程中直接改动服务端配置。
+- 没有配置 Jev key 时，AI 和混合模式在 WebUI 中不可选，API 也会回退到传统规则。
+- 固定侧边栏高度，右侧内容独立滚动；站点页面改为卡片网格，适合查看多个入口。
 - 全量事件统计，支持游标分页、搜索、动作、IP 和时间筛选。
 - 10%、30%、50%、70%、90% 五档阈值，并支持自定义阈值。
 - 检查路径、查询参数、请求头、Cookie、IP 和完整请求体。
@@ -38,7 +42,7 @@
 
 ## 在 Linux 上部署
 
-以下步骤面向 Linux 服务器，命令使用 Bash，配置对应 `v0.2.0`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
+以下步骤面向 Linux 服务器，命令使用 Bash，配置对应 `v0.2.1`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
 
 需要 Git、curl、OpenSSL，以及已安装并运行的 Docker Engine 和 Docker Compose v2。使用容器部署不需要在宿主机安装 Node.js。
 
@@ -61,6 +65,7 @@ chmod 644 secrets/postgres_password
 
 ```dotenv
 UPSTREAM_URL=http://host.docker.internal:9000
+SITE_PORT_RANGE=8080-8099
 GEOIP_DIR=./geoip
 GEOIP_DATABASE_PATH=/app/geoip/GeoIP2-City.mmdb
 GEOIP_ASN_DATABASE_PATH=/app/geoip/GeoIP2-ASN.mmdb
@@ -85,21 +90,33 @@ curl -fsS http://127.0.0.1:4000/api/v1/health
 | --- | ---: | --- |
 | 管理后台 | 3000 | 初始化、规则和事件管理 |
 | 管理 API | 4000 | 健康检查和管理接口 |
-| WAF HTTP | 8080 | 被保护服务的 HTTP 入口 |
+| WAF HTTP | 8080-8099 | 按站点分配的 HTTP 入口 |
 | WAF HTTPS | 8443 | 配置证书后使用 |
 
 当前 Compose 将上述端口发布到宿主机所有接口，PostgreSQL 不对宿主机开放。请限制管理后台和 API 的访问来源；公网管理入口应放在可信的 HTTPS 反向代理后，不要直接开放 `3000` 和 `4000`。
 
 Compose 使用文件型 Docker secret 提供 PostgreSQL 密码。可以通过 `POSTGRES_PASSWORD_FILE_SOURCE` 指向已有密码文件；显式设置 `DATABASE_URL` 时，API 会优先使用它。PostgreSQL 数据和 API 数据目录由命名卷持久化，GeoIP 文件从宿主机 `GEOIP_DIR` 只读挂载。
 
+### 配置多个入口
+
+默认站点固定使用 `8080`。在“站点与上游”页面新建站点时，从当前范围内选择未占用端口，填写上游地址和防护模式。保存后，API 会为启用站点动态监听对应端口；停用站点后，该端口不再接收代理流量。
+
+`SITE_PORT_RANGE` 只在部署启动时读取。若要改成其他范围，例如 `9000-9009`，需要同时修改 `.env` 和 Compose 发布端口，然后重启：
+
+```dotenv
+SITE_PORT_RANGE=9000-9009
+```
+
+默认站点仍要求使用 `PROXY_PORT`，默认值是 `8080`；自定义范围应包含这个端口。
+
 ### 使用发布镜像
 
-不想在服务器构建时，可以从 [v0.2.0 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.0) 下载 API 和 Web 镜像压缩包。先按上面的步骤准备配置和密码文件，再导入镜像：
+不想在服务器构建时，可以从 [v0.2.1 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.1) 下载 API 和 Web 镜像压缩包。先按上面的步骤准备配置和密码文件，再导入镜像：
 
 ```bash
-docker load -i jianflow-waf-api-v0.2.0.tar.gz
-docker load -i jianflow-waf-web-v0.2.0.tar.gz
-IMAGE_TAG=v0.2.0 docker compose up -d --no-build --pull never
+docker load -i jianflow-waf-api-v0.2.1.tar.gz
+docker load -i jianflow-waf-web-v0.2.1.tar.gz
+IMAGE_TAG=v0.2.1 docker compose up -d --no-build --pull never
 ```
 
 `--pull never` 不会下载缺失的镜像；如果本机还没有 PostgreSQL 镜像，先运行 `docker pull postgres:16-alpine`。
@@ -129,7 +146,7 @@ npm run dev
 
 - 管理后台：`http://127.0.0.1:3000`
 - API：`http://127.0.0.1:4000`
-- WAF HTTP 入口：`http://127.0.0.1:8080`
+- WAF HTTP 入口：`http://127.0.0.1:8080`，其他站点使用已分配的端口
 
 本地直接运行时，宿主机上游可以使用 `UPSTREAM_URL=http://127.0.0.1:9000`。没有配置 PostgreSQL 时，设置、规则和事件会保存到 `DATA_DIR` 下的 SQLite 文件；首次初始化只需要设置管理员密码。
 
@@ -163,7 +180,7 @@ JEV_BASE_URL=https://openrouter.ai
 - `https://provider.example.com/api/alpha/decisions`
 - `https://provider.example.com/api/v1/decisions`
 
-没有 key 时仍然可以完成首次初始化。AI 模式在 Jev 不可用时会记录错误并阻断；混合模式会在传统规则通过后按传统结果降级，同时保留 AI 不可用信息。
+没有 key 时仍然可以完成首次初始化，但 WebUI 和 API 都只允许传统规则模式。配置 key 并保存后，才可以选择 AI 或混合模式。AI 模式在 Jev 不可用时会记录错误并阻断；混合模式会在传统规则通过后按传统结果降级，同时保留 AI 不可用信息。
 
 默认阈值如下：
 
@@ -227,7 +244,7 @@ curl -i 'http://127.0.0.1:8080/search?q=union+select+password+from+users'
 
 默认混合模式下，预期返回 `403`，不需要上游或 Jev 在线。普通请求返回 `502` 时，先检查 `UPSTREAM_URL` 和上游服务的监听地址；服务启动异常可查看 `docker compose logs --tail=100 api postgres`。
 
-管理 API 需要先通过 `/api/v1/auth/login` 获取 HttpOnly 会话 Cookie。正式版验证还覆盖 PostgreSQL 迁移、重启持久化、压缩请求、请求头攻击、可信代理 IP、规则导入原子性、2D/3D 地图和 WebGL 回退。
+管理 API 需要先通过 `/api/v1/auth/login` 获取 HttpOnly 会话 Cookie。正式版验证还覆盖 PostgreSQL 迁移、站点端口持久化、动态监听器、按端口转发、重启持久化、压缩请求、请求头攻击、可信代理 IP、规则导入原子性、2D/3D 地图和 WebGL 回退。
 
 ## 项目结构
 

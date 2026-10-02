@@ -1,6 +1,6 @@
 # JianFlow WAF
 
-A self-hosted Web Application Firewall that checks HTTP requests using local rules, Jev AI classification, or both. This guide targets Linux servers and uses Bash commands for v0.2.0.
+A self-hosted Web Application Firewall that checks HTTP requests using local rules, Jev AI classification, or both. This guide targets Linux servers and uses Bash commands for v0.2.1.
 
 [![License: MIT](https://img.shields.io/github/license/wrhc2010/JianFlow-WAF)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/wrhc2010/JianFlow-WAF)](https://github.com/wrhc2010/JianFlow-WAF/releases)
@@ -10,6 +10,8 @@ A self-hosted Web Application Firewall that checks HTTP requests using local rul
 [中文](README.md) | **English**
 
 Run a test deployment before connecting real traffic. A production rollout still needs a security audit, load testing, and staged validation for your application. See the [changelog](CHANGELOG.md) for release details.
+
+Version 0.2.1 adds port-based multi-site entry management. Each enabled site can listen on its own port and forward to its own upstream, while thresholds, model, and AI timeout remain global. The console keeps form edits as drafts until you save them.
 
 ## Screenshot
 
@@ -40,6 +42,7 @@ Edit `.env` to use an upstream and GeoIP paths accessible from the container:
 
 ```dotenv
 UPSTREAM_URL=http://host.docker.internal:9000
+SITE_PORT_RANGE=8080-8099
 GEOIP_DIR=./geoip
 GEOIP_DATABASE_PATH=/app/geoip/GeoIP2-City.mmdb
 GEOIP_ASN_DATABASE_PATH=/app/geoip/GeoIP2-ASN.mmdb
@@ -64,21 +67,33 @@ Wait for the health checks to pass. The health endpoint should return JSON conta
 | --- | ---: | --- |
 | Console | 3000 | Setup, rules, and events |
 | Management API | 4000 | Health checks and management endpoints |
-| WAF HTTP | 8080 | Protected HTTP traffic |
+| WAF HTTP | 8080-8099 | Port-based protected HTTP entries |
 | WAF HTTPS | 8443 | Available after configuring certificates |
 
 The current Compose file publishes these ports on all host interfaces; PostgreSQL is not published. Restrict access to the console and API. Use a trusted HTTPS reverse proxy for remote administration instead of exposing ports 3000 and 4000 directly to the Internet.
 
 PostgreSQL reads its password from a file-backed Docker secret. Use `POSTGRES_PASSWORD_FILE_SOURCE` for an existing password file; an explicit `DATABASE_URL` takes precedence for the API. PostgreSQL and API data use persistent named volumes. GeoIP files are mounted read-only from the host's `GEOIP_DIR`.
 
+### Configure multiple entries
+
+The default site always uses port `8080`. In **Sites and upstreams**, create a site, choose an unused port from the configured range, enter its upstream URL, and select its protection mode. Saving an enabled site starts its listener; disabling or deleting it removes that listener.
+
+`SITE_PORT_RANGE` is read when the deployment starts. To use another range, such as `9000-9009`, update `.env` and the Compose port mapping together, then restart:
+
+```dotenv
+SITE_PORT_RANGE=9000-9009
+```
+
+The default site still uses `PROXY_PORT`, which defaults to `8080`; a custom range must include that port.
+
 ### Use release images
 
-To skip the build, download both image archives from the [v0.2.0 release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.0). Prepare configuration and the password file as above, then import the images:
+To skip the build, download both image archives from the [v0.2.1 release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.1). Prepare configuration and the password file as above, then import the images:
 
 ```bash
-docker load -i jianflow-waf-api-v0.2.0.tar.gz
-docker load -i jianflow-waf-web-v0.2.0.tar.gz
-IMAGE_TAG=v0.2.0 docker compose up -d --no-build --pull never
+docker load -i jianflow-waf-api-v0.2.1.tar.gz
+docker load -i jianflow-waf-web-v0.2.1.tar.gz
+IMAGE_TAG=v0.2.1 docker compose up -d --no-build --pull never
 ```
 
 `--pull never` will not download missing images. If the PostgreSQL image is not available locally, run `docker pull postgres:16-alpine` first.
@@ -104,7 +119,7 @@ chmod 600 .env
 npm run dev
 ```
 
-Do not overwrite `.env` if it already exists. The dev script builds the core package before starting the API and frontend. The console, API, and WAF use ports 3000, 4000, and 8080. When running directly on the host, `UPSTREAM_URL=http://127.0.0.1:9000` can reach a local upstream. Without PostgreSQL configuration, settings, rules, and events persist in SQLite under `DATA_DIR`.
+Do not overwrite `.env` if it already exists. The dev script builds the core package before starting the API and frontend. The console, API, and WAF use ports 3000, 4000, and `8080-8099` by default. When running directly on the host, `UPSTREAM_URL=http://127.0.0.1:9000` can reach a local upstream. Without PostgreSQL configuration, settings, rules, sites, and events persist in SQLite under `DATA_DIR`.
 
 Set the administrator password on first launch; the default username is `admin`. With the default hybrid mode, try a rule-triggering request:
 
@@ -120,6 +135,7 @@ It should return `403` without needing the upstream or AI service.
 - **Rules**: local request normalization and rules for common SQL injection, XSS, traversal, template injection, NoSQL injection, command injection, and unsafe URL patterns. JSON and supported ModSecurity `SecRule` imports include preview, validation, conflict handling, and atomic writes; this is not the full OWASP CRS engine.
 - **Hybrid**: rules first, then Jev. If Jev is unavailable, requests that pass the rules are allowed and logged as degraded.
 - **Inspection**: checks paths, queries, headers, cookies, IPs, and complete request bodies, including JSON, forms, XML, multipart, text, and gzip/deflate/brotli bodies. HTTP and WebSocket handshakes are inspected; subsequent WebSocket frames are passed through.
+- **Sites**: port-based site cards with separate upstream URLs and protection modes, plus create, edit, enable, disable, and delete actions. The default site cannot be deleted.
 - **Console and storage**: all-history statistics, cursor pagination, filters, rule management, encrypted API key storage, PostgreSQL or persistent SQLite, and offline GeoIP with 2D/3D attack views.
 
 Threshold presets are 10%, 30%, 50%, 70%, and 90%, with custom values from 0% to 100%. Configure Jev in the console or use server-side environment variables:
@@ -148,9 +164,9 @@ Apply the configuration with `docker compose up -d --build`. The HTTPS WAF entry
 
 - [Linux deployment](#deploy-on-linux) · [Local development](#develop-locally-on-linux) · [Modes and configuration](#features-and-configuration) · [License](#license)
 - Management API: `GET /api/v1/health` is public; other `/api/v1/*` endpoints require an HttpOnly session cookie obtained from `POST /api/v1/auth/login`. Test rules using `POST /api/v1/rules/test` with `method`, `path`, `query`, and `headers`.
-- **No AI key?** Select rules-only mode. Hybrid mode allows rule-passing requests when Jev is unavailable.
+- **No AI key?** The console disables AI and hybrid modes and the API falls back to rules-only mode. Save a Jev key before selecting either AI mode.
 - **502 on allowed requests?** Check the upstream's listening address and whether `UPSTREAM_URL` is reachable from the API container. Do not use container-local `127.0.0.1` for a host service.
-- **Startup failure?** Run `docker compose logs --tail=100 api postgres` and check the password file, volume access, and configured paths.
+- **Startup failure?** Run `docker compose logs --tail=100 api postgres` and check the password file, volume access, `SITE_PORT_RANGE`, and configured paths.
 - **Production ready?** Validate against your traffic first. Isolate administration, use HTTPS, and complete security and load testing before a production rollout.
 
 ## Contributing

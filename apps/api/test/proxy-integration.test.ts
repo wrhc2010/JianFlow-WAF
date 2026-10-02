@@ -167,3 +167,46 @@ test("rejects HTTP/0.9 and ambiguous request framing", { timeout: 5000 }, async 
     "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n");
   assert.match(conflictingFraming, /^HTTP\/1\.1 400\b/);
 });
+
+test("routes enabled listener ports to their own site upstreams", { timeout: 5000 }, async (t) => {
+  const upstreams = [9101, 9102].map((port) => http.createServer((_request, response) => {
+    response.writeHead(200, { "x-upstream-port": String(port) });
+    response.end(String(port));
+  }));
+  const upstreamPorts = await Promise.all(upstreams.map((upstream) => listen(upstream)));
+  const store = {
+    getSettings: () => ({
+      mode: "traditional", strength: "medium", customThreshold: 0.5, model: "test",
+      aiTimeoutMs: 100, aiBodyLimit: 32768, upstreamUrl: `http://127.0.0.1:${upstreamPorts[0]}`
+    }),
+    getSiteByPort: (port: number) => port === 28081
+      ? { id: "one", name: "One", listenPort: 28081, upstreamUrl: `http://127.0.0.1:${upstreamPorts[0]}`, mode: "traditional", enabled: true, createdAt: "" }
+      : { id: "two", name: "Two", listenPort: 28082, upstreamUrl: `http://127.0.0.1:${upstreamPorts[1]}`, mode: "traditional", enabled: true, createdAt: "" },
+    listRules: () => BUILTIN_RULES,
+    saveEvent: async () => {}
+  } as unknown as Store;
+  const first = createProxyServer(store, 28081);
+  const second = createProxyServer(store, 28082);
+  first.listen(28081, "127.0.0.1");
+  second.listen(28082, "127.0.0.1");
+  await Promise.all([once(first, "listening"), once(second, "listening")]);
+  t.after(() => {
+    first.closeAllConnections();
+    second.closeAllConnections();
+    first.close();
+    second.close();
+    for (const upstream of upstreams) upstream.closeAllConnections();
+    for (const upstream of upstreams) upstream.close();
+  });
+  const responseFor = (port: number) => new Promise<string>((resolve, reject) => {
+    const request = http.get({ host: "127.0.0.1", port, path: "/" }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { body += chunk; });
+      response.on("end", () => resolve(body));
+    });
+    request.on("error", reject);
+  });
+  assert.equal(await responseFor(28081), "9101");
+  assert.equal(await responseFor(28082), "9102");
+});

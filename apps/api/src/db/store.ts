@@ -14,12 +14,13 @@ import { GeoIpResolver, type GeoPoint } from "../geo.js";
 import { decryptSecret, encryptSecret } from "../secrets.js";
 import { migrate } from "./migrate.js";
 import { LocalDatabase, type LocalState } from "./local.js";
-import { SetupConflictError, ValidationError } from "../errors.js";
+import { ConflictError, SetupConflictError, ValidationError } from "../errors.js";
 import { MAX_TOTAL_RULES, validateRule } from "../rule-import.js";
 
-type Site = {
+export type Site = {
   id: string;
   name: string;
+  listenPort: number;
   upstreamUrl: string;
   mode: ProtectionMode;
   enabled: boolean;
@@ -123,6 +124,7 @@ export class Store {
   private setupInProgress = false;
   private mutationQueue: Promise<unknown> = Promise.resolve();
   private builtinRuleIds = new Set<string>();
+  private siteChangeListener: (() => void | Promise<void>) | undefined;
 
   constructor() {
     this.pool = config.databaseUrl ? new Pool({ connectionString: config.databaseUrl }) : null;
@@ -130,6 +132,7 @@ export class Store {
     this.sites.set("default", {
       id: "default",
       name: "默认站点",
+      listenPort: config.proxyPort,
       upstreamUrl: this.settings.upstreamUrl,
       mode: this.settings.mode,
       enabled: true,
@@ -162,18 +165,22 @@ export class Store {
       this.syncRuntimeSettings();
       const site = this.sites.get("default");
       if (site) {
+        site.listenPort = config.proxyPort;
         site.upstreamUrl = this.settings.upstreamUrl;
         site.mode = this.settings.mode;
       } else {
         this.sites.set("default", {
           id: "default",
           name: "默认站点",
+          listenPort: config.proxyPort,
           upstreamUrl: this.settings.upstreamUrl,
           mode: this.settings.mode,
           enabled: true,
           createdAt: new Date().toISOString()
         });
       }
+      this.normalizeSitePorts();
+      this.normalizeUnavailableSiteModes();
       this.local!.writeState(this.snapshot());
       for (const event of this.local!.readEvents()) this.events.push(event);
       return;
@@ -225,11 +232,12 @@ export class Store {
     this.syncRuntimeSettings();
 
     await this.pool.query(
-      `INSERT INTO sites (id, name, upstream_url, mode, enabled)
-       VALUES ('default', $1, $2, $3, TRUE)
+      `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
+       VALUES ('default', $1, $2, $3, $4, TRUE)
        ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name,
-       upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = TRUE`,
-      ["默认站点", this.settings.upstreamUrl, this.settings.mode]
+       listen_port = EXCLUDED.listen_port, upstream_url = EXCLUDED.upstream_url,
+       mode = EXCLUDED.mode, enabled = TRUE`,
+      ["默认站点", config.proxyPort, this.settings.upstreamUrl, this.settings.mode]
     );
 
     const ruleResult = await this.pool.query(`SELECT * FROM rules ORDER BY created_at ASC`);
@@ -248,6 +256,9 @@ export class Store {
       this.sites.clear();
       for (const site of siteResult.rows) this.sites.set(String(site.id), mapSite(site));
     }
+    this.normalizeSitePorts();
+    this.normalizeUnavailableSiteModes();
+    await this.persistSiteCompatibilityFields();
   }
 
   setupStatus(): {
@@ -328,7 +339,6 @@ export class Store {
       ...settings,
       jevBaseUrl: settings.jevBaseUrl ? normalizeBaseUrl(settings.jevBaseUrl) : this.settings.jevBaseUrl
     };
-    validateSettings(candidate);
     let apiKeyCiphertext = this.apiKeyCiphertext;
     if (apiKey !== undefined) {
       if (apiKey === null || apiKey.trim() === "") {
@@ -338,6 +348,11 @@ export class Store {
         apiKeyCiphertext = encryptSecret(apiKey.trim(), config.sessionSecret);
       }
     }
+    const effectiveApiKey = apiKey !== undefined
+      ? (apiKeyCiphertext ? decryptSecret(apiKeyCiphertext, config.sessionSecret) : config.environmentApiKey)
+      : config.openRouterKey;
+    candidate.mode = effectiveApiKey ? candidate.mode : "traditional";
+    validateSettings(candidate);
     if (this.pool) {
       await this.pool.query(
         `UPDATE settings SET mode = $1, strength = $2, custom_threshold = $3,
@@ -363,43 +378,78 @@ export class Store {
     }
     if (this.pool) await this.persistDefaultSite();
     else this.local!.writeState(this.snapshot());
+    await this.notifySitesChanged();
     return this.getSettings();
   }
 
   listSites(): Site[] {
-    return [...this.sites.values()];
+    return [...this.sites.values()].map((site) => ({ ...site }));
   }
 
-  async saveSite(input: Omit<Site, "createdAt" | "id"> & { id?: string }): Promise<Site> {
-    validateSite(input);
-    const site: Site = {
-      id: input.id ?? randomUUID(),
-      name: input.name,
-      upstreamUrl: input.upstreamUrl,
-      mode: input.mode,
-      enabled: input.enabled,
-      createdAt: new Date().toISOString()
-    };
-    if (this.pool) {
-      await this.pool.query(
-        `INSERT INTO sites (id, name, upstream_url, mode, enabled)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name,
-         upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled`,
-        [site.id, site.name, site.upstreamUrl, site.mode, site.enabled]
-      );
-    } else {
-      this.local!.writeState({ ...this.snapshot(), sites: [...this.sites.values()].filter((item) => item.id !== site.id).concat(site) });
-    }
-    this.sites.set(site.id, site);
-    return site;
+  getSiteByPort(port: number): Site | undefined {
+    const site = [...this.sites.values()].find((entry) => entry.listenPort === port && entry.enabled);
+    return site ? { ...site } : undefined;
+  }
+
+  setSiteChangeListener(listener: (() => void | Promise<void>) | undefined): void {
+    this.siteChangeListener = listener;
+  }
+
+  async saveSite(input: Omit<Site, "createdAt" | "id"> & { id?: string; listenPort?: number }): Promise<Site> {
+    return this.serializeMutation(async () => {
+      const current = input.id ? this.sites.get(input.id) : undefined;
+      const listenPort = input.listenPort ?? current?.listenPort ?? this.findAvailableSitePort();
+      const candidate = { ...input, listenPort };
+      validateSite(candidate);
+      if (input.id === "default" && listenPort !== config.proxyPort) {
+        throw new ValidationError(`默认站点必须使用入口端口 ${config.proxyPort}`);
+      }
+      const duplicate = [...this.sites.values()].find((site) => site.id !== input.id && site.listenPort === listenPort);
+      if (duplicate) throw new ConflictError(`入口端口 ${listenPort} 已被站点“${duplicate.name}”占用`);
+      const site: Site = {
+        id: input.id ?? randomUUID(),
+        name: input.name,
+        listenPort,
+        upstreamUrl: input.upstreamUrl,
+        mode: effectiveProtectionMode(input.mode, Boolean(config.openRouterKey)),
+        enabled: input.enabled,
+        createdAt: current?.createdAt ?? new Date().toISOString()
+      };
+      if (site.id === "default") {
+        this.settings.upstreamUrl = site.upstreamUrl;
+        this.settings.mode = site.mode;
+      }
+      if (this.pool) {
+        await this.pool.query(
+          `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, listen_port = EXCLUDED.listen_port,
+           upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled`,
+          [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled]
+        );
+        if (site.id === "default") {
+          await this.pool.query(
+            `UPDATE settings SET upstream_url = $1, mode = $2, updated_at = NOW() WHERE id = 1`,
+            [site.upstreamUrl, site.mode]
+          );
+        }
+      } else {
+        this.local!.writeState({ ...this.snapshot(), sites: [...this.sites.values()].filter((item) => item.id !== site.id).concat(site) });
+      }
+      this.sites.set(site.id, site);
+      await this.notifySitesChanged();
+      return { ...site };
+    });
   }
 
   async deleteSite(id: string): Promise<void> {
-    if (id === "default") return;
-    if (this.pool) await this.pool.query(`DELETE FROM sites WHERE id = $1`, [id]);
-    else this.local!.writeState({ ...this.snapshot(), sites: [...this.sites.values()].filter((site) => site.id !== id) });
-    this.sites.delete(id);
+    return this.serializeMutation(async () => {
+      if (id === "default") throw new ConflictError("默认站点不能删除");
+      if (this.pool) await this.pool.query(`DELETE FROM sites WHERE id = $1`, [id]);
+      else this.local!.writeState({ ...this.snapshot(), sites: [...this.sites.values()].filter((site) => site.id !== id) });
+      this.sites.delete(id);
+      await this.notifySitesChanged();
+    });
   }
 
   listRules(): WafRule[] {
@@ -753,6 +803,47 @@ export class Store {
     this.settings.apiKeySource = this.apiKeyCiphertext ? "database" : config.environmentApiKey ? "environment" : "none";
   }
 
+  private normalizeSitePorts(): void {
+    const used = new Set<number>();
+    const ordered = [...this.sites.values()].sort((left, right) => {
+      if (left.id === "default") return -1;
+      if (right.id === "default") return 1;
+      return left.createdAt.localeCompare(right.createdAt);
+    });
+    for (const site of ordered) {
+      if (!isSitePort(site.listenPort) || used.has(site.listenPort)) {
+        site.listenPort = this.findAvailableSitePort(used);
+      }
+      used.add(site.listenPort);
+    }
+  }
+
+  private normalizeUnavailableSiteModes(): void {
+    if (config.openRouterKey) return;
+    for (const site of this.sites.values()) {
+      if (site.mode !== "traditional") site.mode = "traditional";
+    }
+    if (this.settings.mode !== "traditional") this.settings.mode = "traditional";
+  }
+
+  private findAvailableSitePort(used = new Set([...this.sites.values()].map((site) => site.listenPort))): number {
+    for (let port = config.sitePortRange.min; port <= config.sitePortRange.max; port += 1) {
+      if (!used.has(port)) return port;
+    }
+    throw new ValidationError(`没有可用的站点入口端口（${formatPortRange()}）`);
+  }
+
+  private async persistSiteCompatibilityFields(): Promise<void> {
+    if (!this.pool) return;
+    for (const site of this.sites.values()) {
+      await this.pool.query(
+        `UPDATE sites SET listen_port = $1, mode = $2 WHERE id = $3`,
+        [site.listenPort, site.mode, site.id]
+      );
+    }
+    await this.pool.query(`UPDATE settings SET mode = $1 WHERE id = 1`, [this.settings.mode]);
+  }
+
   private async persistDefaultSite(): Promise<void> {
     const site = this.sites.get("default");
     if (!site) return;
@@ -761,12 +852,17 @@ export class Store {
       return;
     }
     await this.pool.query(
-      `INSERT INTO sites (id, name, upstream_url, mode, enabled)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name,
-       upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled`,
-      [site.id, site.name, site.upstreamUrl, site.mode, site.enabled]
+       listen_port = EXCLUDED.listen_port, upstream_url = EXCLUDED.upstream_url,
+       mode = EXCLUDED.mode, enabled = EXCLUDED.enabled`,
+      [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled]
     );
+  }
+
+  private async notifySitesChanged(): Promise<void> {
+    await this.siteChangeListener?.();
   }
 
   private serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -800,6 +896,7 @@ function validateSettings(settings: AppSettings): void {
 
 function validateSite(site: Omit<Site, "createdAt" | "id"> & { id?: string }): void {
   if (!site.name.trim() || site.name.length > 256) throw new ValidationError("站点名称必须是 1 到 256 字符");
+  if (!isSitePort(site.listenPort)) throw new ValidationError(`入口端口必须在 ${formatPortRange()} 范围内`);
   if (!["ai", "traditional", "hybrid"].includes(site.mode)) throw new ValidationError("站点防护模式无效");
   if (typeof site.enabled !== "boolean") throw new ValidationError("站点启用状态无效");
   validateHttpEndpoint(site.upstreamUrl, "上游地址");
@@ -891,11 +988,29 @@ function mapSite(row: QueryResultRow): Site {
   return {
     id: String(row.id),
     name: String(row.name),
+    listenPort: row.listen_port === null || row.listen_port === undefined ? 0 : Number(row.listen_port),
     upstreamUrl: String(row.upstream_url),
     mode: row.mode as ProtectionMode,
     enabled: Boolean(row.enabled),
     createdAt: new Date(row.created_at as string).toISOString()
   };
+}
+
+function isSitePort(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isInteger(value)
+    && value >= config.sitePortRange.min
+    && value <= config.sitePortRange.max;
+}
+
+function formatPortRange(): string {
+  return config.sitePortRange.min === config.sitePortRange.max
+    ? String(config.sitePortRange.min)
+    : `${config.sitePortRange.min}-${config.sitePortRange.max}`;
+}
+
+function effectiveProtectionMode(mode: ProtectionMode, aiConfigured: boolean): ProtectionMode {
+  return aiConfigured || mode === "traditional" ? mode : "traditional";
 }
 
 function mapEvent(row: QueryResultRow): EventRecord {

@@ -10,6 +10,7 @@ import {
   Bot,
   Check,
   CircleGauge,
+  Edit3,
   FileCode2,
   Filter,
   Globe2,
@@ -19,6 +20,7 @@ import {
   Moon,
   Network,
   PanelLeft,
+  Plus,
   Play,
   RefreshCw,
   Save,
@@ -28,8 +30,10 @@ import {
   SlidersHorizontal,
   Sun,
   TerminalSquare,
+  Trash2,
   Upload,
-  X
+  X,
+  Power
 } from "lucide-react";
 
 type Mode = "ai" | "traditional" | "hybrid";
@@ -48,6 +52,18 @@ type Settings = {
   apiKeyConfigured: boolean;
   apiKeySource: "environment" | "database" | "none";
 };
+
+type Site = {
+  id: string;
+  name: string;
+  listenPort: number;
+  upstreamUrl: string;
+  mode: Mode;
+  enabled: boolean;
+  createdAt: string;
+};
+
+type SiteDraft = Pick<Site, "name" | "listenPort" | "upstreamUrl" | "mode" | "enabled">;
 
 type Rule = {
   id: string;
@@ -104,6 +120,9 @@ type TimeSeriesPoint = {
 };
 
 type SystemStatus = {
+  proxyPort: number;
+  apiPort: number;
+  sitePortRange: { min: number; max: number };
   maxRequestBodyBytes: number;
   httpsEnabled: boolean;
   geoIpAsnConfigured: boolean;
@@ -128,6 +147,15 @@ const defaultSettings: Settings = {
   upstreamUrl: "http://127.0.0.1:9000",
   apiKeyConfigured: false,
   apiKeySource: "none"
+};
+
+const defaultSystem: SystemStatus = {
+  proxyPort: 8080,
+  apiPort: 4000,
+  sitePortRange: { min: 8080, max: 8099 },
+  maxRequestBodyBytes: 10 * 1024 * 1024,
+  httpsEnabled: false,
+  geoIpAsnConfigured: false
 };
 
 const thresholds: Record<Exclude<Strength, "custom">, number> = {
@@ -295,6 +323,7 @@ function LoginScreen(props: {
 function Console({ onLogout }: { onLogout: () => void }) {
   const [collapsed, setCollapsed] = useState(false);
   const [section, setSection] = useState("overview");
+  const [dirtySections, setDirtySections] = useState<Record<string, boolean>>({});
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem("jianflow-theme") as Theme | null) ?? "dark");
 
   useEffect(() => {
@@ -310,6 +339,14 @@ function Console({ onLogout }: { onLogout: () => void }) {
     { id: "sites", label: "站点与上游", icon: Network },
     { id: "settings", label: "防护策略", icon: SlidersHorizontal }
   ];
+  const navigate = (nextSection: string) => {
+    if (nextSection === section) return;
+    if (dirtySections[section] && !window.confirm("当前页面有未保存修改，确定离开吗？")) return;
+    setSection(nextSection);
+  };
+  const setDirty = (key: string, dirty: boolean) => {
+    setDirtySections((current) => ({ ...current, [key]: dirty }));
+  };
   return (
     <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
@@ -317,7 +354,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
         <nav className="nav-list">
           {nav.map((item) => {
             const Icon = item.icon;
-            return <button key={item.id} className={`nav-item ${section === item.id ? "active" : ""}`} onClick={() => setSection(item.id)} title={item.label}><Icon size={17} />{!collapsed && <span>{item.label}</span>}</button>;
+            return <button key={item.id} className={`nav-item ${section === item.id ? "active" : ""}`} onClick={() => navigate(item.id)} title={item.label}><Icon size={17} />{!collapsed && <span>{item.label}</span>}</button>;
           })}
         </nav>
         <div className="sidebar-bottom">
@@ -337,8 +374,8 @@ function Console({ onLogout }: { onLogout: () => void }) {
           {section === "map" && <MapDashboard />}
           {section === "events" && <Events />}
           {section === "rules" && <Rules />}
-          {section === "sites" && <Sites />}
-          {section === "settings" && <SettingsPanel />}
+          {section === "sites" && <Sites onDirtyChange={(dirty) => setDirty("sites", dirty)} />}
+          {section === "settings" && <SettingsPanel onDirtyChange={(dirty) => setDirty("settings", dirty)} />}
         </div>
       </main>
     </div>
@@ -356,7 +393,7 @@ function useConsoleData() {
   const [rules, setRules] = useState<Rule[]>([]);
   const [mapData, setMapData] = useState<MapData>({ points: [], countries: [], attackers: [], blocked: 0 });
   const [timeseries, setTimeseries] = useState<TimeSeriesPoint[]>([]);
-  const [system, setSystem] = useState<SystemStatus>({ maxRequestBodyBytes: 10 * 1024 * 1024, httpsEnabled: false, geoIpAsnConfigured: false });
+  const [system, setSystem] = useState<SystemStatus>(defaultSystem);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -722,86 +759,339 @@ function Rules() {
   );
 }
 
-function Sites() {
-  const { settings, setSettings, system, error, loading, refresh } = useConsoleData();
-  const [saved, setSaved] = useState(false);
+function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
+  const [sites, setSites] = useState<Site[]>([]);
+  const [settings, setSettings] = useState<Settings>(defaultSettings);
+  const [system, setSystem] = useState<SystemStatus>(defaultSystem);
+  const [form, setForm] = useState<SiteDraft | null>(null);
+  const [originalForm, setOriginalForm] = useState<SiteDraft | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const [status, setStatus] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const [siteResult, nextSettings, nextSystem] = await Promise.all([
+        api<{ data: Site[] }>("/api/v1/sites"),
+        api<Settings>("/api/v1/settings"),
+        api<SystemStatus>("/api/v1/system")
+      ]);
+      setSites(siteResult.data);
+      setSettings(nextSettings);
+      setSystem(nextSystem);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "站点加载失败");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void load(); }, []);
+  const formDirty = Boolean(form && originalForm && JSON.stringify(form) !== JSON.stringify(originalForm));
+  useEffect(() => {
+    onDirtyChange(formDirty);
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (!formDirty) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", beforeUnload);
+      onDirtyChange(false);
+    };
+  }, [formDirty, onDirtyChange]);
+
+  const availablePorts = (currentPort?: number) => Array.from(
+    { length: system.sitePortRange.max - system.sitePortRange.min + 1 },
+    (_, index) => system.sitePortRange.min + index
+  ).filter((port) => port === currentPort || !sites.some((site) => site.listenPort === port));
+
+  const openCreate = () => {
+    const port = availablePorts()[0] ?? system.sitePortRange.min;
+    const next: SiteDraft = {
+      name: "",
+      listenPort: port,
+      upstreamUrl: settings.upstreamUrl,
+      mode: settings.apiKeyConfigured ? settings.mode : "traditional",
+      enabled: true
+    };
+    setEditingId(null);
+    setForm(next);
+    setOriginalForm(next);
+    setStatus("");
+  };
+
+  const openEdit = (site: Site) => {
+    const next: SiteDraft = {
+      name: site.name,
+      listenPort: site.listenPort,
+      upstreamUrl: site.upstreamUrl,
+      mode: settings.apiKeyConfigured ? site.mode : "traditional",
+      enabled: site.enabled
+    };
+    setEditingId(site.id);
+    setForm(next);
+    setOriginalForm(next);
+    setStatus("");
+  };
+
+  const closeEditor = () => {
+    if (formDirty && !window.confirm("当前站点有未保存修改，确定取消吗？")) return;
+    setForm(null);
+    setOriginalForm(null);
+    setEditingId(null);
+  };
+
+  const save = async () => {
+    if (!form) return;
+    setStatus("");
+    try {
+      const saved = await api<Site>(editingId ? `/api/v1/sites/${editingId}` : "/api/v1/sites", {
+        method: editingId ? "PATCH" : "POST",
+        body: JSON.stringify(form)
+      });
+      setSites((current) => editingId
+        ? current.map((site) => site.id === saved.id ? saved : site)
+        : [...current, saved]);
+      setForm(null);
+      setOriginalForm(null);
+      setEditingId(null);
+      setStatus("站点已保存");
+    } catch (failure) {
+      setStatus(failure instanceof Error ? failure.message : "站点保存失败");
+    }
+  };
+
+  const toggle = async (site: Site) => {
+    try {
+      const updated = await api<Site>(`/api/v1/sites/${site.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: !site.enabled })
+      });
+      setSites((current) => current.map((entry) => entry.id === updated.id ? updated : entry));
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "站点状态更新失败");
+    }
+  };
+
+  const remove = async (site: Site) => {
+    if (site.id === "default") return;
+    if (!window.confirm(`确定删除站点“${site.name}”吗？`)) return;
+    try {
+      await api(`/api/v1/sites/${site.id}`, { method: "DELETE" });
+      setSites((current) => current.filter((entry) => entry.id !== site.id));
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "站点删除失败");
+    }
+  };
+
   return (
     <section>
-      <PageHeading eyebrow="流量入口" title="站点与上游" description="配置 WAF 保护的上游服务和数据面入口。" />
-      {error && <ErrorNotice message={error} onRetry={() => void refresh()} />}
-      <div className="site-banner"><div className="site-icon"><Globe2 size={22} /></div><div><strong>默认站点</strong><span>当前所有 8080 流量使用该上游</span></div><span className="status-badge green">运行中</span></div>
-      <Panel title="默认上游">
-        <div className="form-grid">
-          <label className="field-label">上游地址<input value={settings.upstreamUrl} onChange={(event) => setSettings({ ...settings, upstreamUrl: event.target.value })} /></label>
-          <label className="field-label">监听入口<input value="http://0.0.0.0:8080" readOnly /></label>
-          <label className="field-label">WebSocket<input value="支持握手透传" readOnly /></label>
-          <label className="field-label">检查上限<input value={`${Math.max(1, Math.round(system.maxRequestBodyBytes / 1024 / 1024 * 10) / 10)} MB / 请求`} readOnly /></label>
-        </div>
-        <div className="panel-actions"><button className="primary-button" disabled={loading} onClick={async () => { await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify({ upstreamUrl: settings.upstreamUrl }) }); setSaved(true); setTimeout(() => setSaved(false), 2200); }}><Save size={15} />保存上游</button>{saved && <span className="save-confirm"><Check size={14} />已保存</span>}</div>
-      </Panel>
-      <div className="two-column">
-        <Panel title="数据面状态"><StatusLine icon={Server} label="反向代理" value="HTTP :8080" state="good" /><StatusLine icon={Network} label="上游连接" value={settings.upstreamUrl} state="good" /><StatusLine icon={Globe2} label="HTTPS 终止" value="待配置证书" state="warn" /></Panel>
-        <Panel title="部署提示"><div className="note-box"><span className="note-title">Linux / Docker</span><p>上游地址可以填写 Compose 网络内的服务名。GeoIP 数据库挂载到 DATA_DIR/geoip 后，大屏会自动显示国家和地区。</p></div></Panel>
+      <PageHeading
+        eyebrow="流量入口"
+        title="站点与上游"
+        description={`按入口端口管理受保护服务。可用端口范围 ${system.sitePortRange.min}-${system.sitePortRange.max}。`}
+        action={<button className="primary-button" onClick={openCreate}><Plus size={15} />新建站点</button>}
+      />
+      {error && <ErrorNotice message={error} onRetry={() => void load()} />}
+      {status && <div className="inline-status"><Check size={14} />{status}</div>}
+      {loading ? <LoadingRows count={3} /> : <div className="site-grid">
+        {sites.map((site) => (
+          <article className={`site-card ${site.enabled ? "" : "disabled"}`} key={site.id}>
+            <div className="site-card-head">
+              <div>
+                <span className="site-card-kicker">{site.id === "default" ? "默认入口" : "站点"}</span>
+                <h2>{site.name}</h2>
+              </div>
+              <span className={`status-badge ${site.enabled ? "green" : "amber"}`}>{site.enabled ? "运行中" : "已停用"}</span>
+            </div>
+            <div className="site-card-data">
+              <div><span>入口端口</span><strong>:{site.listenPort}</strong></div>
+              <div><span>上游地址</span><strong title={site.upstreamUrl}>{site.upstreamUrl}</strong></div>
+              <div><span>防护模式</span><strong>{modeLabel(site.mode)}</strong></div>
+            </div>
+            <div className="site-card-actions">
+              <button className="icon-button" title="编辑站点" aria-label="编辑站点" onClick={() => openEdit(site)}><Edit3 size={15} /></button>
+              <button className="icon-button" title={site.enabled ? "停用站点" : "启用站点"} aria-label={site.enabled ? "停用站点" : "启用站点"} onClick={() => void toggle(site)}><Power size={15} /></button>
+              <button className="icon-button danger-button" title={site.id === "default" ? "默认站点不可删除" : "删除站点"} aria-label="删除站点" disabled={site.id === "default"} onClick={() => void remove(site)}><Trash2 size={15} /></button>
+            </div>
+          </article>
+        ))}
+      </div>}
+      <div className="two-column sites-footer">
+        <Panel title="数据面状态">
+          <StatusLine icon={Server} label="HTTP 监听" value={`:${system.sitePortRange.min}-${system.sitePortRange.max}`} state="good" />
+          <StatusLine icon={Network} label="启用入口" value={`${sites.filter((site) => site.enabled).length} 个站点`} state="good" />
+          <StatusLine icon={Globe2} label="HTTPS 终止" value={system.httpsEnabled ? `:${system.proxyPort === 8080 ? 8443 : "已配置"}` : "待配置证书"} state={system.httpsEnabled ? "good" : "warn"} />
+        </Panel>
+        <Panel title="部署提示">
+          <div className="note-box"><span className="note-title">Linux / Docker</span><p>端口范围由 SITE_PORT_RANGE 控制。修改范围后要同步 Compose 端口映射并重启；上游地址可以填写 Compose 网络内的服务名。</p></div>
+        </Panel>
+      </div>
+      {form && <SiteEditor
+        form={form}
+        editingId={editingId}
+        hasJevKey={settings.apiKeyConfigured}
+        ports={editingId === "default" ? [system.proxyPort] : availablePorts(form.listenPort)}
+        onChange={(patch) => setForm((current) => current ? { ...current, ...patch } : current)}
+        onSave={() => void save()}
+        onCancel={closeEditor}
+        status={status}
+      />}
+    </section>
+  );
+}
+
+function SiteEditor(props: {
+  form: SiteDraft;
+  editingId: string | null;
+  hasJevKey: boolean;
+  ports: number[];
+  onChange: (patch: Partial<SiteDraft>) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  status: string;
+}) {
+  return <div className="modal-backdrop site-editor-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) props.onCancel(); }}>
+    <section className="site-editor" role="dialog" aria-modal="true" aria-label={props.editingId ? "编辑站点" : "新建站点"}>
+      <div className="drawer-head"><div><p className="eyebrow">站点配置</p><h2>{props.editingId ? "编辑站点" : "新建站点"}</h2></div><button className="icon-button" title="关闭" aria-label="关闭" onClick={props.onCancel}><X size={16} /></button></div>
+      <div className="site-editor-body">
+        <label className="field-label">站点名称<input value={props.form.name} onChange={(event) => props.onChange({ name: event.target.value })} autoFocus /></label>
+        <label className="field-label">入口端口<select value={props.form.listenPort} onChange={(event) => props.onChange({ listenPort: Number(event.target.value) })}>{props.ports.map((port) => <option key={port} value={port}>:{port}</option>)}</select></label>
+        <label className="field-label">上游地址<input value={props.form.upstreamUrl} onChange={(event) => props.onChange({ upstreamUrl: event.target.value })} placeholder="http://app:9000" /></label>
+        <label className="field-label">防护模式<select value={props.form.mode} onChange={(event) => props.onChange({ mode: event.target.value as Mode })}><option value="traditional">传统规则</option><option value="hybrid" disabled={!props.hasJevKey}>混合模式{!props.hasJevKey ? "（需配置 Jev key）" : ""}</option><option value="ai" disabled={!props.hasJevKey}>AI 判断{!props.hasJevKey ? "（需配置 Jev key）" : ""}</option></select></label>
+        <label className="check-label site-enabled"><input type="checkbox" checked={props.form.enabled} onChange={(event) => props.onChange({ enabled: event.target.checked })} />启用此入口</label>
+        {!props.hasJevKey && <div className="inline-status">未配置 Jev key，AI 和混合模式不可用，保存时会使用传统规则。</div>}
+      </div>
+      {props.status && <div className="form-error"><AlertTriangle size={15} />{props.status}</div>}
+      <div className="site-editor-actions"><button className="secondary-button" onClick={props.onCancel}>取消</button><button className="primary-button" onClick={props.onSave}><Save size={15} />保存站点</button></div>
+    </section>
+  </div>;
+}
+
+function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
+  const [serverSettings, setServerSettings] = useState<Settings | null>(null);
+  const [draft, setDraft] = useState<Settings>(defaultSettings);
+  const [apiKey, setApiKey] = useState("");
+  const [clearApiKey, setClearApiKey] = useState(false);
+  const [jevStatus, setJevStatus] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const next = await api<Settings>("/api/v1/settings");
+      setServerSettings(next);
+      setDraft(next);
+      setApiKey("");
+      setClearApiKey(false);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "策略加载失败");
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { void load(); }, []);
+  const dirty = Boolean(serverSettings && (
+    JSON.stringify(draft) !== JSON.stringify(serverSettings) || apiKey.trim() || clearApiKey
+  ));
+  useEffect(() => {
+    onDirtyChange(dirty);
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (!dirty) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", beforeUnload);
+      onDirtyChange(false);
+    };
+  }, [dirty, onDirtyChange]);
+
+  const hasJevKey = draft.apiKeyConfigured && !clearApiKey || Boolean(apiKey.trim());
+  const updateDraft = (patch: Partial<Settings>) => setDraft((current) => ({ ...current, ...patch }));
+  const cancel = () => {
+    if (serverSettings) setDraft(serverSettings);
+    setApiKey("");
+    setClearApiKey(false);
+    setJevStatus("");
+  };
+  const save = async () => {
+    const { apiKeyConfigured: _configured, apiKeySource: _source, ...editable } = draft;
+    try {
+      const body = {
+        ...editable,
+        ...(clearApiKey ? { apiKey: null } : apiKey.trim() ? { apiKey: apiKey.trim() } : {})
+      };
+      const next = await api<Settings>("/api/v1/settings", { method: "PATCH", body: JSON.stringify(body) });
+      setServerSettings(next);
+      setDraft(next);
+      setApiKey("");
+      setClearApiKey(false);
+      setJevStatus("策略已保存");
+    } catch (failure) {
+      setJevStatus(failure instanceof Error ? failure.message : "策略保存失败");
+    }
+  };
+  const modeOptions: Array<[Mode, string, string, typeof Network]> = [
+    ["hybrid", "混合模式", "先规则过滤，再由 Jev 复核", Network],
+    ["ai", "AI 判断", "由 Jev 判断请求恶意概率", Bot],
+    ["traditional", "传统规则", "仅使用本地规则引擎", FileCode2]
+  ];
+  const strengthOptions: Array<[Strength, string, string, string]> = [
+    ["veryLow", "极低", "概率 ≥ 10%", "仅拦截高风险特征"],
+    ["low", "低", "概率 ≥ 30%", "积极拦截"],
+    ["medium", "中", "概率 ≥ 50%", "推荐默认"],
+    ["high", "高", "概率 ≥ 70%", "减少误报"],
+    ["extreme", "极高", "概率 ≥ 90%", "只拦截高置信度"],
+    ["custom", "自定义", `概率 ≥ ${Math.round(draft.customThreshold * 100)}%`, "手动设置"]
+  ];
+  return (
+    <section>
+      <PageHeading
+        eyebrow="防护策略"
+        title="防护策略"
+        description="调整全局检测强度、Jev 参数和故障降级策略。"
+        action={<div className="panel-actions"><span className={`draft-state ${dirty ? "dirty" : ""}`}>{dirty ? "有未保存修改" : "已同步"}</span><button className="secondary-button" disabled={!dirty || loading} onClick={cancel}>取消更改</button><button className="primary-button" disabled={!dirty || loading} onClick={() => void save()}><Save size={15} />保存策略</button></div>}
+      />
+      {error && <ErrorNotice message={error} onRetry={() => void load()} />}
+      <div className="two-column settings-layout">
+        <Panel title="防护模式">
+          <div className="mode-options">{modeOptions.map(([value, label, detail, Icon]) => {
+            const disabled = value !== "traditional" && !hasJevKey;
+            return <button key={value} type="button" disabled={disabled} className={`mode-option ${draft.mode === value ? "selected" : ""} ${disabled ? "disabled-option" : ""}`} onClick={() => updateDraft({ mode: value })}><span className="mode-option-icon"><Icon size={17} /></span><span><strong>{label}</strong><small>{detail}{disabled ? " · 需配置 Jev key" : ""}</small></span>{draft.mode === value && <Check size={16} className="check-icon" />}</button>;
+          })}</div>
+          <div className="divider" />
+          <label className="field-label">Jev baseURL<input value={draft.jevBaseUrl} onChange={(event) => updateDraft({ jevBaseUrl: event.target.value })} placeholder="https://openrouter.ai 或完整决策地址" /></label>
+          <label className="field-label">Jev 模型<input value={draft.model} onChange={(event) => updateDraft({ model: event.target.value })} /></label>
+          <label className="field-label">API key<input type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setClearApiKey(false); }} placeholder={draft.apiKeyConfigured ? "已配置，输入新 key 可替换" : "可选，不影响首次初始化"} autoComplete="new-password" /></label>
+          <div className="api-state"><span className={`status-dot ${hasJevKey ? "" : "amber"}`} /><span>{hasJevKey ? `Jev key 已配置 · ${draft.apiKeySource === "environment" ? ".env" : "WebUI"}` : "Jev key 未配置"}</span><span className="panel-meta">服务端加密保存，不回显</span></div>
+          <div className="form-grid compact-grid">
+            <label className="field-label">AI 超时（毫秒）<input type="number" min="100" max="60000" value={draft.aiTimeoutMs} onChange={(event) => updateDraft({ aiTimeoutMs: Number(event.target.value) })} /></label>
+            <label className="field-label">AI 正文上限（字节）<input type="number" min="1024" value={draft.aiBodyLimit} onChange={(event) => updateDraft({ aiBodyLimit: Number(event.target.value) })} /></label>
+          </div>
+          <div className="settings-actions"><button className="secondary-button" disabled={dirty} onClick={async () => { try { const result = await api<{ available: boolean; error?: string; latencyMs: number }>("/api/v1/settings/test-jev", { method: "POST", body: "{}" }); setJevStatus(result.available ? `Jev 连通成功 · ${result.latencyMs}ms` : `Jev 不可用 · ${result.error ?? "未知错误"}`); } catch (failure) { setJevStatus(failure instanceof Error ? failure.message : "Jev 测试失败"); } }}><Activity size={15} />测试 Jev 连接</button>{draft.apiKeySource === "database" && <button className="text-button" onClick={() => { setClearApiKey(true); setApiKey(""); setJevStatus("已标记移除 WebUI key，点击保存后生效"); }}><X size={14} />移除 WebUI key</button>}</div>
+          {jevStatus && <div className="inline-status">{jevStatus}</div>}
+        </Panel>
+        <Panel title="防护强度">
+          <div className="strength-list">{strengthOptions.map(([value, label, threshold, note]) => <button key={value} type="button" className={`strength-row ${draft.strength === value ? "selected" : ""}`} onClick={() => updateDraft({ strength: value })}><span className="radio">{draft.strength === value && <span />}</span><span className="strength-copy"><strong>{label}</strong><small>{note}</small></span><span className="strength-threshold">{threshold}</span></button>)}</div>
+          {draft.strength === "custom" && <label className="field-label custom-field">自定义阈值<input type="range" min="0" max="100" value={Math.round(draft.customThreshold * 100)} onChange={(event) => updateDraft({ customThreshold: Number(event.target.value) / 100 })} /><strong>{Math.round(draft.customThreshold * 100)}%</strong></label>}
+          <div className="note-box"><span className="note-title">故障策略</span><p>AI 模式在 Jev 不可用时产生错误事件并阻断；混合模式在传统规则通过后按传统结果降级放行，同时记录 AI 不可用。</p></div>
+        </Panel>
       </div>
     </section>
   );
 }
 
-function SettingsPanel() {
-  const { settings, setSettings, error, loading, refresh } = useConsoleData();
-  const [jevStatus, setJevStatus] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const save = async () => {
-    const { apiKeyConfigured: _configured, apiKeySource: _source, ...editable } = settings;
-    try {
-      const next = await api<Settings>("/api/v1/settings", { method: "PATCH", body: JSON.stringify({ ...editable, ...(apiKey ? { apiKey } : {}) }) });
-      setSettings(next);
-      setApiKey("");
-      setJevStatus("策略已保存");
-      setTimeout(() => setJevStatus(""), 2200);
-    } catch (failure) {
-      setJevStatus(failure instanceof Error ? failure.message : "策略保存失败");
-    }
-  };
-  return (
-    <section>
-      <PageHeading eyebrow="防护策略" title="防护策略" description="调整规则、Jev AI、供应商地址和故障降级策略。" action={<button className="primary-button" disabled={loading} onClick={() => void save()}><Save size={15} />保存策略</button>} />
-      {error && <ErrorNotice message={error} onRetry={() => void refresh()} />}
-      <div className="two-column settings-layout">
-        <Panel title="防护模式">
-          <div className="mode-options">{[
-            ["hybrid", "混合模式", "先规则过滤，再由 Jev 复核", Network],
-            ["ai", "AI 判断", "由 Jev 判断请求恶意概率", Bot],
-            ["traditional", "传统规则", "仅使用本地规则引擎", FileCode2]
-          ].map(([value, label, detail, Icon]) => {
-            const ModeIcon = Icon as typeof Network;
-            return <button key={value as string} className={`mode-option ${settings.mode === value ? "selected" : ""}`} onClick={() => setSettings({ ...settings, mode: value as Mode })}><span className="mode-option-icon"><ModeIcon size={17} /></span><span><strong>{label as string}</strong><small>{detail as string}</small></span>{settings.mode === value && <Check size={16} className="check-icon" />}</button>;
-          })}</div>
-          <div className="divider" />
-          <label className="field-label">Jev baseURL<input value={settings.jevBaseUrl} onChange={(event) => setSettings({ ...settings, jevBaseUrl: event.target.value })} placeholder="https://openrouter.ai 或完整决策地址" /></label>
-          <label className="field-label">Jev 模型<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} /></label>
-          <label className="field-label">API key<input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={settings.apiKeyConfigured ? "已配置，输入新 key 可替换" : "可选，不影响首次初始化"} autoComplete="new-password" /></label>
-          <div className="api-state"><span className={`status-dot ${settings.apiKeyConfigured ? "" : "amber"}`} /><span>{settings.apiKeyConfigured ? `Jev key 已配置 · ${settings.apiKeySource === "environment" ? ".env" : "WebUI"}` : "Jev key 未配置"}</span><span className="panel-meta">服务端加密保存，不回显</span></div>
-          <button className="secondary-button" onClick={async () => { const result = await api<{ available: boolean; error?: string; latencyMs: number }>("/api/v1/settings/test-jev", { method: "POST", body: "{}" }); setJevStatus(result.available ? `Jev 连通成功 · ${result.latencyMs}ms` : `Jev 不可用 · ${result.error ?? "未知错误"}`); }}><Activity size={15} />测试 Jev 连接</button>
-          {settings.apiKeySource === "database" && <button className="text-button" onClick={async () => { const next = await api<Settings>("/api/v1/settings", { method: "PATCH", body: JSON.stringify({ apiKey: null }) }); setSettings(next); setJevStatus("WebUI key 已移除，已恢复环境变量回退"); }}><X size={14} />移除 WebUI key</button>}
-          {jevStatus && <div className="inline-status">{jevStatus}</div>}
-        </Panel>
-        <Panel title="防护强度">
-          <div className="strength-list">{[
-            ["veryLow", "极低", "概率 ≥ 10%", "仅拦截高风险特征"],
-            ["low", "低", "概率 ≥ 30%", "积极拦截"],
-            ["medium", "中", "概率 ≥ 50%", "推荐默认"],
-            ["high", "高", "概率 ≥ 70%", "减少误报"],
-            ["extreme", "极高", "概率 ≥ 90%", "只拦截高置信度"],
-            ["custom", "自定义", `概率 ≥ ${Math.round(settings.customThreshold * 100)}%`, "手动设置"]
-          ].map(([value, label, threshold, note]) => <button key={value as string} className={`strength-row ${settings.strength === value ? "selected" : ""}`} onClick={() => setSettings({ ...settings, strength: value as Strength })}><span className="radio">{settings.strength === value && <span />}</span><span className="strength-copy"><strong>{label as string}</strong><small>{note as string}</small></span><span className="strength-threshold">{threshold as string}</span></button>)}</div>
-          {settings.strength === "custom" && <label className="field-label custom-field">自定义阈值<input type="range" min="0" max="100" value={Math.round(settings.customThreshold * 100)} onChange={(event) => setSettings({ ...settings, customThreshold: Number(event.target.value) / 100 })} /><strong>{Math.round(settings.customThreshold * 100)}%</strong></label>}
-          <div className="note-box"><span className="note-title">故障策略</span><p>AI 模式在 Jev 不可用时产生错误事件并阻断；混合模式在传统规则通过后按传统结果降级放行，同时记录 AI 不可用。</p></div>
-          <div className="threshold-reference">{Object.entries(thresholds).map(([key, value]) => <span key={key}><i className={`threshold-dot ${key}`} />{key === "veryLow" ? "极低" : key === "low" ? "低" : key === "medium" ? "中" : key === "high" ? "高" : "极高"} {value}%</span>)}</div>
-        </Panel>
-      </div>
-    </section>
-  );
+function modeLabel(mode: Mode): string {
+  return mode === "ai" ? "AI 判断" : mode === "hybrid" ? "混合模式" : "传统规则";
 }
 
 function thresholdLabel(settings: Settings): string {

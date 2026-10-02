@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS sites (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
+  listen_port INTEGER,
   upstream_url TEXT NOT NULL,
   mode TEXT NOT NULL DEFAULT 'hybrid',
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS jev_base_url TEXT NOT NULL DEFAULT 'https://openrouter.ai';
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS listen_port INTEGER;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS api_key_ciphertext TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_salt TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_hash TEXT;

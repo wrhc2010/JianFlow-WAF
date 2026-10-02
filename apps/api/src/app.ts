@@ -19,7 +19,7 @@ import { config } from "./config.js";
 import { parseRuleImport, RuleImportError, validateRule } from "./rule-import.js";
 import { Store, type EventFilters } from "./db/store.js";
 import { classifyWithJev } from "./jev.js";
-import { SetupConflictError, ValidationError } from "./errors.js";
+import { ConflictError, SetupConflictError, ValidationError } from "./errors.js";
 
 export async function createApp(store: Store, logger = true) {
   const app = Fastify({
@@ -42,6 +42,7 @@ export async function createApp(store: Store, logger = true) {
     };
     const status =
       error instanceof SetupConflictError
+        || error instanceof ConflictError
         ? 409
         : error instanceof ValidationError || failure.validation
           ? 422
@@ -209,6 +210,7 @@ export async function createApp(store: Store, logger = true) {
   app.get("/api/v1/dashboard/summary", async () => store.summary());
   app.get("/api/v1/system", async () => ({
     proxyPort: config.proxyPort, apiPort: config.apiPort,
+    sitePortRange: config.sitePortRange,
     maxRequestBodyBytes: config.maxRequestBodyBytes,
     httpsEnabled: Boolean(config.tlsKeyPath && config.tlsCertPath),
     geoIpAsnConfigured: Boolean(config.geoIpAsnDatabasePath),
@@ -371,31 +373,86 @@ export async function createApp(store: Store, logger = true) {
   app.post<{
     Body: {
       name?: string;
+      listenPort?: number;
       upstreamUrl?: string;
       mode?: ProtectionMode;
       enabled?: boolean;
     };
-  }>("/api/v1/sites", async (request, reply) => {
+  }>("/api/v1/sites", {
+    schema: {
+      body: {
+        type: "object",
+        required: ["name", "listenPort", "upstreamUrl"],
+        additionalProperties: false,
+        properties: {
+          name: { type: "string", minLength: 1, maxLength: 256 },
+          listenPort: { type: "integer", minimum: config.sitePortRange.min, maximum: config.sitePortRange.max },
+          upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
+          mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
+          enabled: { type: "boolean" }
+        }
+      }
+    }
+  }, async (request, reply) => {
     const body = request.body ?? {};
-    if (!body.name || !body.upstreamUrl) {
+    if (!body.name || body.listenPort === undefined || !body.upstreamUrl) {
       return reply.code(422).send({
         type: "about:blank",
         title: "Validation error",
-        status: 422,
-        detail: "name 和 upstreamUrl 必填",
+        status: 422, detail: "name、listenPort 和 upstreamUrl 必填",
       });
     }
     const site = await store.saveSite({
       name: body.name,
+      listenPort: body.listenPort,
       upstreamUrl: body.upstreamUrl,
       mode: body.mode ?? "hybrid",
       enabled: body.enabled ?? true,
     });
     return reply.code(201).send(site);
   });
+  app.patch<{
+    Params: { id: string };
+    Body: {
+      name?: string;
+      listenPort?: number;
+      upstreamUrl?: string;
+      mode?: ProtectionMode;
+      enabled?: boolean;
+    };
+  }>("/api/v1/sites/:id", {
+    schema: {
+      body: {
+        type: "object",
+        minProperties: 1,
+        additionalProperties: false,
+        properties: {
+          name: { type: "string", minLength: 1, maxLength: 256 },
+          listenPort: { type: "integer", minimum: config.sitePortRange.min, maximum: config.sitePortRange.max },
+          upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
+          mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
+          enabled: { type: "boolean" }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const current = store.listSites().find((site) => site.id === request.params.id);
+    if (!current) {
+      return reply.code(404).send({
+        type: "about:blank", title: "Not found", status: 404, detail: "站点不存在"
+      });
+    }
+    const site = await store.saveSite({ ...current, ...request.body, id: current.id });
+    return site;
+  });
   app.delete<{ Params: { id: string } }>(
     "/api/v1/sites/:id",
-    async (request) => {
+    async (request, reply) => {
+      if (!store.listSites().some((site) => site.id === request.params.id)) {
+        return reply.code(404).send({
+          type: "about:blank", title: "Not found", status: 404, detail: "站点不存在"
+        });
+      }
       await store.deleteSite(request.params.id);
       return { ok: true };
     },

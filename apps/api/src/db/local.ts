@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { AppSettings, EventRecord } from "./store.js";
 import type { WafRule } from "@jev-waf/core";
 import { SetupConflictError } from "../errors.js";
+import type { ProtectionMode } from "@jev-waf/core";
 
 export type LocalState = {
   settings: AppSettings;
@@ -12,7 +13,7 @@ export type LocalState = {
   apiKeyCiphertext: string | null;
   rules: WafRule[];
   builtinRuleIds?: string[] | undefined;
-  sites: Array<{ id: string; name: string; upstreamUrl: string; mode: "ai" | "traditional" | "hybrid"; enabled: boolean; createdAt: string }>;
+  sites: Array<{ id: string; name: string; listenPort: number; upstreamUrl: string; mode: ProtectionMode; enabled: boolean; createdAt: string }>;
 };
 
 export class LocalDatabase {

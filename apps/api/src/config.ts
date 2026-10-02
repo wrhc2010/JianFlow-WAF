@@ -16,6 +16,23 @@ function numberEnv(name: string, fallback: number, min = 1, max = Number.MAX_SAF
   return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
+export type SitePortRange = {
+  min: number;
+  max: number;
+};
+
+function parsePortRange(value: string | undefined, fallback: SitePortRange): SitePortRange {
+  const raw = value?.trim() ?? "";
+  const match = /^(\d{1,5})(?:-(\d{1,5}))?$/.exec(raw);
+  if (!match) return fallback;
+  const min = Number(match[1]);
+  const max = Number(match[2] ?? match[1]);
+  if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || min < 1 || max > 65535 || min > max) {
+    return fallback;
+  }
+  return { min, max };
+}
+
 export type DatabaseUrlOptions = {
   host: string;
   port: string;
@@ -50,13 +67,19 @@ function databaseUrlFromSecret(): string {
   });
 }
 const databaseUrl = process.env.DATABASE_URL?.trim() || databaseUrlFromSecret();
+const proxyPort = numberEnv("PROXY_PORT", 8080);
+const sitePortRange = parsePortRange(process.env.SITE_PORT_RANGE, { min: 8080, max: 8099 });
+if (proxyPort < sitePortRange.min || proxyPort > sitePortRange.max) {
+  throw new Error(`PROXY_PORT ${proxyPort} must be inside SITE_PORT_RANGE ${sitePortRange.min}-${sitePortRange.max}`);
+}
 
 export const config = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   apiHost: process.env.API_HOST ?? "127.0.0.1",
   apiPort: numberEnv("API_PORT", 4000),
   proxyHost: process.env.PROXY_HOST ?? "0.0.0.0",
-  proxyPort: numberEnv("PROXY_PORT", 8080),
+  proxyPort,
+  sitePortRange,
   httpsPort: numberEnv("HTTPS_PORT", 8443),
   tlsKeyPath: process.env.TLS_KEY_PATH ?? "",
   tlsCertPath: process.env.TLS_CERT_PATH ?? "",

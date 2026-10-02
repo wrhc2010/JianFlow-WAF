@@ -43,6 +43,19 @@ test("management setup, production HTTP login, validation and private key respon
   assert.doesNotMatch(saved.body, /must-not-be-returned|ciphertext/);
   assert.equal(saved.json().apiKeyConfigured, true);
   assert.equal(saved.json().apiKeySource, "database");
+  const site = await app.inject({ method: "POST", url: "/api/v1/sites", headers: { cookie },
+    payload: { name: "Orders", listenPort: 8081, upstreamUrl: "http://127.0.0.1:9101", mode: "hybrid", enabled: true } });
+  assert.equal(site.statusCode, 201);
+  assert.equal(site.json().listenPort, 8081);
+  const editedSite = await app.inject({ method: "PATCH", url: `/api/v1/sites/${site.json().id}`, headers: { cookie },
+    payload: { upstreamUrl: "http://127.0.0.1:9102" } });
+  assert.equal(editedSite.statusCode, 200);
+  assert.equal(editedSite.json().upstreamUrl, "http://127.0.0.1:9102");
+  const duplicateSite = await app.inject({ method: "POST", url: "/api/v1/sites", headers: { cookie },
+    payload: { name: "Collision", listenPort: 8081, upstreamUrl: "http://127.0.0.1:9103" } });
+  assert.equal(duplicateSite.statusCode, 409);
+  const defaultDelete = await app.inject({ method: "DELETE", url: "/api/v1/sites/default", headers: { cookie } });
+  assert.equal(defaultDelete.statusCode, 409);
   for (const query of ["cursor=invalid", "since=not-a-date", "limit=501", "action=invalid"]) {
     assert.equal((await app.inject({ url: `/api/v1/events?${query}`, headers: { cookie } })).statusCode, 422);
   }
