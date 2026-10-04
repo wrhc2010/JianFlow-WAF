@@ -180,8 +180,9 @@ function inspectionFailure(
   };
 }
 
-function upgradeBlock(socket: Duplex, status: number, requestId: string): void {
-  socket.end(`HTTP/1.1 ${status} WAF Rejected\r\nConnection: close\r\nContent-Length: 0\r\nX-Jev-Request-Id: ${requestId}\r\n\r\n`);
+function upgradeBlock(socket: Duplex, status: number, requestId: string, retryAfter?: number): void {
+  const retry = retryAfter === undefined ? "" : `Retry-After: ${Math.max(1, Math.ceil(retryAfter))}\r\n`;
+  socket.end(`HTTP/1.1 ${status} WAF Rejected\r\nConnection: close\r\nContent-Length: 0\r\nX-Jev-Request-Id: ${requestId}\r\n${retry}\r\n`);
 }
 
 function requestOf(request: http.IncomingMessage): WafRequest {
@@ -384,7 +385,7 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
     release = admission.release;
     if (!admission.allowed) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: admission.reason ?? "限速", module: "cc" };
-      await saveOnce(decision, 429); upgradeBlock(socket, 429, requestId); return;
+      await saveOnce(decision, 429); upgradeBlock(socket, 429, requestId, admission.retryAfter ?? 1); return;
     }
     const result = await inspectRequest(store, wafRequest, resolved, requestId, access.skip);
     decision = result.decision;

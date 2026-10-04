@@ -146,10 +146,20 @@ test("HTTP and HTTPS stop together; occupied ports report errors and recover on 
   assert.equal(failed.runtime!.state, "error"); assert.match(failed.runtime!.lastError!, /EADDRINUSE/); assert.equal(store.readiness(), false);
   await new Promise<void>((resolve) => occupied.close(() => resolve())); await manager.sync();
   assert.equal(store.listSites().find((entry) => entry.id === failed.id)!.runtime!.state, "active"); assert.ok(store.readiness());
+  await store.saveSite({ ...failed, policy: { ...defaultPolicy(), rateLimit: { ...defaultPolicy().rateLimit, enabled: true, requestsPerSecond: 0.1, burst: 1 } } });
+  assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 200);
+  const rejectedUpgrade = await new Promise<{ status: number; retryAfter: string | undefined }>((resolve, reject) => {
+    const request = http.get({ host: "127.0.0.1", port, headers: { connection: "Upgrade", upgrade: "websocket", "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==", "sec-websocket-version": "13" } }, (response) => {
+      response.resume(); response.on("end", () => resolve({ status: response.statusCode!, retryAfter: response.headers["retry-after"] }));
+    }); request.on("error", reject);
+  });
+  assert.equal(rejectedUpgrade.status, 429); assert.equal(rejectedUpgrade.retryAfter, "10");
+  await store.saveSite({ ...failed, policy: null });
+  const reachedBeforeAcl = reached;
   await store.saveScopedRule(failed.id, "access-rules", { name: "Mandatory block", method: "*", path: "*", cidr: "127.0.0.0/8", action: "block", expiresAt: "2099-01-01T00:00:00Z", enabled: true });
   await store.updateSettings({ apiKey: "synthetic", defaultPolicy: { ...defaultPolicy(), enforcement: "observe" } });
   await store.saveSite({ ...failed, mode: "ai", policy: { ...defaultPolicy(), enforcement: "observe" } });
-  assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 403); assert.equal(reached, 1);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 403); assert.equal(reached, reachedBeforeAcl);
   config.tlsKeyPath = "not-a-key";
   await store.saveSite({ ...site, enabled: true });
   assert.equal(store.listSites().find((entry) => entry.id === "default")!.runtime!.state, "error");
