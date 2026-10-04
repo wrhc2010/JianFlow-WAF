@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: jevwaf
       POSTGRES_USER: jevwaf
@@ -17,6 +18,7 @@ services:
 
   api:
     image: ghcr.io/wrhc2010/jianflow-waf-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
     build:
       context: .
       dockerfile: apps/api/Dockerfile
@@ -47,6 +49,12 @@ services:
       AI_TIMEOUT_MS: ${AI_TIMEOUT_MS:-2000}
       AI_BODY_LIMIT: ${AI_BODY_LIMIT:-32768}
       MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-10485760}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-30}
+      MAX_PROXY_CONCURRENT: ${MAX_PROXY_CONCURRENT:-200}
+      MAX_TRACKED_CLIENTS: ${MAX_TRACKED_CLIENTS:-10000}
+      AI_MAX_CONCURRENT: ${AI_MAX_CONCURRENT:-8}
+      AI_REQUESTS_PER_MINUTE: ${AI_REQUESTS_PER_MINUTE:-120}
+      EVENT_QUEUE_LIMIT: ${EVENT_QUEUE_LIMIT:-2000}
       DATA_DIR: /app/data
       GEOIP_DATABASE_PATH: ${GEOIP_DATABASE_PATH:-/app/geoip/GeoLite2-City.mmdb}
       GEOIP_ASN_DATABASE_PATH: ${GEOIP_ASN_DATABASE_PATH:-/app/geoip/GeoLite2-ASN.mmdb}
@@ -54,7 +62,7 @@ services:
     secrets:
       - postgres_password
     ports:
-      - "4000:4000"
+      - "127.0.0.1:4000:4000"
       - "${SITE_PORT_RANGE:-8080-8099}:${SITE_PORT_RANGE:-8080-8099}"
       - "8443:8443"
     volumes:
@@ -75,11 +83,12 @@ services:
 
   web:
     image: ghcr.io/wrhc2010/jianflow-waf-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
     build:
       context: .
       dockerfile: apps/web/Dockerfile
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     depends_on:
       api:
         condition: service_healthy

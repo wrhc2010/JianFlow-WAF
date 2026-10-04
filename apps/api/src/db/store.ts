@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { Pool, type QueryResultRow } from "pg";
 import {
   BUILTIN_RULES,
+  defaultPolicy, safeRequestPath,
+  type SitePolicy, type RuleException, type AccessRule,
   type EvaluationSettings,
   type ProtectionMode,
   type ProtectionStrength,
@@ -16,6 +18,12 @@ import { migrate } from "./migrate.js";
 import { LocalDatabase, type LocalState } from "./local.js";
 import { ConflictError, SetupConflictError, ValidationError } from "../errors.js";
 import { MAX_TOTAL_RULES, validateRule } from "../rule-import.js";
+import { parsePolicy, parseScopedRule } from "../policy-validation.js";
+
+export type RuntimeStatus = {
+  state: "pending" | "active" | "disabled" | "error";
+  desiredRevision: number; appliedRevision: number; lastError?: string;
+};
 
 export type Site = {
   id: string;
@@ -25,6 +33,9 @@ export type Site = {
   mode: ProtectionMode;
   enabled: boolean;
   createdAt: string;
+  policy?: SitePolicy | null;
+  revision?: number;
+  runtime?: RuntimeStatus;
 };
 
 export type EventRecord = {
@@ -49,6 +60,15 @@ export type EventRecord = {
   longitude?: number | undefined;
   asn?: number | undefined;
   createdAt: string;
+  siteId?: string;
+  listenPort?: number;
+  policyRevision?: number;
+  module?: string;
+  localInspectionComplete?: boolean;
+  aiInspectionComplete?: boolean;
+  aiOmittedReason?: string;
+  wouldBlock?: boolean;
+  exceptionIds?: string[];
 };
 
 export type AppSettings = EvaluationSettings & {
@@ -56,6 +76,7 @@ export type AppSettings = EvaluationSettings & {
   jevBaseUrl: string;
   apiKeyConfigured: boolean;
   apiKeySource: "environment" | "database" | "none";
+  defaultPolicy: SitePolicy;
 };
 
 export type EventFilters = {
@@ -66,6 +87,7 @@ export type EventFilters = {
   since?: string;
   until?: string;
   search?: string;
+  siteId?: string;
 };
 
 export type TimeSeriesPoint = {
@@ -92,6 +114,7 @@ function defaultSettings(): AppSettings {
   jevBaseUrl: config.jevBaseUrl,
   apiKeyConfigured: Boolean(config.openRouterKey),
   apiKeySource: config.openRouterKey ? "environment" : "none"
+  ,defaultPolicy: { ...defaultPolicy(), strength: config.defaultStrength }
   };
 }
 
@@ -118,7 +141,13 @@ export class Store {
   private initialized = Boolean(config.adminPassword && config.adminPassword !== "change-me-now");
   private readonly sites = new Map<string, Site>();
   private rules: WafRule[] = BUILTIN_RULES.map(withRuleMetadata);
-  private readonly events: EventRecord[] = [];
+  private scopedRules: Array<RuleException | AccessRule> = [];
+  private readonly runtime = new Map<string, RuntimeStatus>();
+  private readonly eventWrites = new Set<Promise<void>>();
+  private droppedEvents = 0;
+  private eventWriteErrors = 0;
+  private retentionTimer: ReturnType<typeof setInterval> | undefined;
+  private retentionWork: Promise<number> | undefined;
   private credential: { salt: string; hash: string } | undefined;
   private apiKeyCiphertext: string | null = null;
   private setupInProgress = false;
@@ -146,6 +175,8 @@ export class Store {
       const state = this.local!.readState();
       if (state) {
         this.settings = state.settings;
+        this.settings.defaultPolicy ??= { ...defaultPolicy(), strength: this.settings.strength, customThreshold: this.settings.customThreshold };
+        this.scopedRules = state.scopedRules ?? [];
         this.initialized = Boolean(state.initialized && state.credential);
         this.credential = state.credential;
         this.apiKeyCiphertext = state.apiKeyCiphertext;
@@ -182,7 +213,7 @@ export class Store {
       this.normalizeSitePorts();
       this.normalizeUnavailableSiteModes();
       this.local!.writeState(this.snapshot());
-      for (const event of this.local!.readEvents()) this.events.push(event);
+      this.startRetention();
       return;
     }
 
@@ -198,7 +229,7 @@ export class Store {
     const settingResult = await this.pool.query(
       `SELECT mode, strength, custom_threshold, model, jev_base_url,
               api_key_ciphertext, admin_password_salt, admin_password_hash,
-              initialized, ai_timeout_ms, ai_body_limit, upstream_url
+              initialized, ai_timeout_ms, ai_body_limit, upstream_url, default_policy
        FROM settings WHERE id = 1`
     );
     const row = settingResult.rows[0] as Record<string, unknown> | undefined;
@@ -213,7 +244,8 @@ export class Store {
         aiBodyLimit: Number(row.ai_body_limit),
         upstreamUrl: String(row.upstream_url),
         apiKeyConfigured: Boolean(config.environmentApiKey || row.api_key_ciphertext),
-        apiKeySource: row.api_key_ciphertext ? "database" : config.environmentApiKey ? "environment" : "none"
+        apiKeySource: row.api_key_ciphertext ? "database" : config.environmentApiKey ? "environment" : "none",
+        defaultPolicy: row.default_policy ? parsePolicy(row.default_policy) : { ...defaultPolicy(), strength: row.strength as ProtectionStrength, customThreshold: Number(row.custom_threshold) }
       };
       this.initialized = Boolean(row.initialized);
       if (row.admin_password_salt && row.admin_password_hash) {
@@ -235,7 +267,7 @@ export class Store {
       `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
        VALUES ('default', $1, $2, $3, $4, TRUE)
        ON CONFLICT (id) DO UPDATE SET
-       listen_port = EXCLUDED.listen_port, upstream_url = EXCLUDED.upstream_url,
+       upstream_url = EXCLUDED.upstream_url,
        mode = EXCLUDED.mode`,
       ["默认站点", config.proxyPort, this.settings.upstreamUrl, this.settings.mode]
     );
@@ -259,6 +291,10 @@ export class Store {
     this.normalizeSitePorts();
     this.normalizeUnavailableSiteModes();
     await this.persistSiteCompatibilityFields();
+    await this.pool.query("CREATE UNIQUE INDEX IF NOT EXISTS sites_port_unique ON sites(listen_port)");
+    const scoped = await this.pool.query("SELECT value FROM scoped_rules ORDER BY id");
+    this.scopedRules = scoped.rows.map((entry) => entry.value as RuleException | AccessRule);
+    this.startRetention();
   }
 
   setupStatus(): {
@@ -321,11 +357,11 @@ export class Store {
   }
 
   getSettings(): AppSettings {
-    return {
+    return structuredClone({
       ...this.settings,
       apiKeyConfigured: Boolean(config.openRouterKey),
       apiKeySource: this.settings.apiKeySource
-    };
+    });
   }
 
   async updateSettings(next: SettingsUpdate): Promise<AppSettings> {
@@ -339,6 +375,14 @@ export class Store {
       ...settings,
       jevBaseUrl: settings.jevBaseUrl ? normalizeBaseUrl(settings.jevBaseUrl) : this.settings.jevBaseUrl
     };
+    if (settings.defaultPolicy !== undefined) candidate.defaultPolicy = parsePolicy(settings.defaultPolicy);
+    else if (settings.strength !== undefined || settings.customThreshold !== undefined) candidate.defaultPolicy = {
+      ...candidate.defaultPolicy, strength: candidate.strength, customThreshold: candidate.customThreshold
+    };
+    if (settings.defaultPolicy !== undefined) {
+      candidate.strength = candidate.defaultPolicy.strength;
+      candidate.customThreshold = candidate.defaultPolicy.customThreshold;
+    }
     let apiKeyCiphertext = this.apiKeyCiphertext;
     if (apiKey !== undefined) {
       if (apiKey === null || apiKey.trim() === "") {
@@ -357,6 +401,7 @@ export class Store {
       ...site,
       upstreamUrl: site.id === "default" ? candidate.upstreamUrl : site.upstreamUrl,
       mode: effectiveProtectionMode(site.id === "default" ? candidate.mode : site.mode, Boolean(effectiveApiKey))
+      ,revision: (site.revision ?? 1) + 1
     }));
     const client = this.pool ? await this.pool.connect() : null;
     try {
@@ -367,18 +412,18 @@ export class Store {
            model = $4, jev_base_url = $5, ai_timeout_ms = $6, ai_body_limit = $7,
            upstream_url = $8,
            api_key_ciphertext = CASE WHEN $9::boolean THEN $10::text ELSE api_key_ciphertext END,
-           updated_at = NOW() WHERE id = 1`,
+           default_policy = $11::jsonb, updated_at = NOW() WHERE id = 1`,
           [
             candidate.mode, candidate.strength, candidate.customThreshold, candidate.model,
             candidate.jevBaseUrl, candidate.aiTimeoutMs, candidate.aiBodyLimit, candidate.upstreamUrl,
             apiKey !== undefined,
-            apiKeyCiphertext ?? null
+            apiKeyCiphertext ?? null, JSON.stringify(candidate.defaultPolicy)
           ]
         );
         for (const site of sites) {
           await client.query(
-            `UPDATE sites SET upstream_url = $1, mode = $2 WHERE id = $3`,
-            [site.upstreamUrl, site.mode, site.id]
+            `UPDATE sites SET upstream_url = $1, mode = $2, revision = $4 WHERE id = $3`,
+            [site.upstreamUrl, site.mode, site.id, site.revision]
           );
         }
         await client.query("COMMIT");
@@ -400,7 +445,68 @@ export class Store {
   }
 
   listSites(): Site[] {
-    return [...this.sites.values()].map((site) => ({ ...site }));
+    return [...this.sites.values()].map((site) => structuredClone({ ...site,
+      runtime: this.runtime.get(site.id) ?? { state: site.enabled ? "pending" : "disabled", desiredRevision: site.revision ?? 1, appliedRevision: 0 }
+    }));
+  }
+
+  effectivePolicy(site: Site): SitePolicy { return structuredClone(site.policy ?? this.settings.defaultPolicy); }
+
+  reportRuntime(id: string, status: RuntimeStatus): void { this.runtime.set(id, status); }
+
+  readiness(): boolean {
+    return this.listSites().every((site) => !site.enabled || site.runtime?.state === "active"
+      && site.runtime.appliedRevision === (site.revision ?? 1));
+  }
+
+  async retryListeners(): Promise<void> { await this.notifySitesChanged(); }
+
+  listScopedRules(siteId: string, kind: "exceptions" | "access-rules"): Array<RuleException | AccessRule> {
+    return structuredClone(this.scopedRules.filter((rule) => rule.siteId === siteId
+      && (kind === "exceptions" ? "ruleIds" in rule : "cidr" in rule)));
+  }
+
+  async saveScopedRule(siteId: string, kind: "exceptions" | "access-rules", input: unknown, id: string = randomUUID()): Promise<RuleException | AccessRule> {
+    return this.serializeMutation(async () => {
+      if (!this.sites.has(siteId)) throw new ValidationError("站点不存在");
+      const rule = parseScopedRule(input, siteId, id, kind);
+      if ("ruleIds" in rule && rule.ruleIds.some((ruleId) => !this.rules.some((entry) => entry.id === ruleId))) throw new ValidationError("例外引用了不存在的规则");
+      const next = this.scopedRules.filter((entry) => entry.id !== id).concat(rule);
+      if (next.filter((entry) => entry.siteId === siteId).length > 500) throw new ConflictError("每个站点最多保存 500 条例外及访问控制");
+      const site = { ...this.sites.get(siteId)!, revision: (this.sites.get(siteId)!.revision ?? 1) + 1 };
+      const client = this.pool ? await this.pool.connect() : null;
+      try {
+        if (client) {
+          await client.query("BEGIN");
+          await client.query("INSERT INTO scoped_rules(id,site_id,kind,value) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET value=EXCLUDED.value", [id, siteId, kind, JSON.stringify(rule)]);
+          await client.query("UPDATE sites SET revision=$2 WHERE id=$1", [siteId, site.revision]);
+          await client.query("COMMIT");
+        } else this.local!.writeState({ ...this.snapshot(), scopedRules: next, sites: [...this.sites.values()].map((entry) => entry.id === siteId ? site : entry) });
+      } catch (error) { if (client) await client.query("ROLLBACK"); throw error; } finally { client?.release(); }
+      this.scopedRules = next;
+      this.sites.set(siteId, site);
+      await this.notifySitesChanged();
+      return structuredClone(rule);
+    });
+  }
+
+  async deleteScopedRule(siteId: string, id: string): Promise<void> {
+    return this.serializeMutation(async () => {
+      const next = this.scopedRules.filter((entry) => !(entry.id === id && entry.siteId === siteId));
+      const site = { ...this.sites.get(siteId)!, revision: (this.sites.get(siteId)!.revision ?? 1) + 1 };
+      const client = this.pool ? await this.pool.connect() : null;
+      try {
+        if (client) {
+          await client.query("BEGIN");
+          await client.query("DELETE FROM scoped_rules WHERE id=$1 AND site_id=$2", [id, siteId]);
+          await client.query("UPDATE sites SET revision=$2 WHERE id=$1", [siteId, site.revision]);
+          await client.query("COMMIT");
+        } else this.local!.writeState({ ...this.snapshot(), scopedRules: next, sites: [...this.sites.values()].map((entry) => entry.id === siteId ? site : entry) });
+      } catch (error) { if (client) await client.query("ROLLBACK"); throw error; } finally { client?.release(); }
+      this.scopedRules = next;
+      this.sites.set(siteId, site);
+      await this.notifySitesChanged();
+    });
   }
 
   getSiteByPort(port: number): Site | undefined {
@@ -412,7 +518,7 @@ export class Store {
     this.siteChangeListener = listener;
   }
 
-  async saveSite(input: Omit<Site, "createdAt" | "id"> & { id?: string; listenPort?: number }): Promise<Site> {
+  async saveSite(input: Omit<Site, "createdAt" | "id" | "runtime" | "revision"> & { id?: string; listenPort?: number }): Promise<Site> {
     return this.serializeMutation(async () => {
       const current = input.id ? this.sites.get(input.id) : undefined;
       const listenPort = input.listenPort ?? current?.listenPort ?? this.findAvailableSitePort();
@@ -430,7 +536,9 @@ export class Store {
         upstreamUrl: input.upstreamUrl,
         mode: effectiveProtectionMode(input.mode, Boolean(config.openRouterKey)),
         enabled: input.enabled,
-        createdAt: current?.createdAt ?? new Date().toISOString()
+        createdAt: current?.createdAt ?? new Date().toISOString(),
+        policy: input.policy === undefined ? current?.policy ?? null : input.policy === null ? null : parsePolicy(input.policy),
+        revision: (current?.revision ?? 0) + 1
       };
       const settings = site.id === "default"
         ? { ...this.settings, upstreamUrl: site.upstreamUrl, mode: site.mode }
@@ -440,11 +548,12 @@ export class Store {
         if (client) {
           await client.query("BEGIN");
           await client.query(
-            `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled, policy, revision)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, listen_port = EXCLUDED.listen_port,
-             upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled`,
-            [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled]
+             upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled,
+             policy = EXCLUDED.policy, revision = EXCLUDED.revision`,
+            [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled, site.policy ? JSON.stringify(site.policy) : null, site.revision]
           );
           if (site.id === "default") {
             await client.query(
@@ -468,16 +577,25 @@ export class Store {
       this.settings = settings;
       this.sites.set(site.id, site);
       await this.notifySitesChanged();
-      return { ...site };
+      return this.listSites().find((entry) => entry.id === site.id)!;
     });
   }
 
   async deleteSite(id: string): Promise<void> {
     return this.serializeMutation(async () => {
       if (id === "default") throw new ConflictError("默认站点不能删除");
-      if (this.pool) await this.pool.query(`DELETE FROM sites WHERE id = $1`, [id]);
-      else this.local!.writeState({ ...this.snapshot(), sites: [...this.sites.values()].filter((site) => site.id !== id) });
+      if (this.pool) {
+        const client = await this.pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query("DELETE FROM scoped_rules WHERE site_id=$1", [id]);
+          await client.query("DELETE FROM sites WHERE id=$1", [id]);
+          await client.query("COMMIT");
+        } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+      } else this.local!.writeState({ ...this.snapshot(), sites: [...this.sites.values()].filter((site) => site.id !== id), scopedRules: this.scopedRules.filter((rule) => rule.siteId !== id) });
+      this.scopedRules = this.scopedRules.filter((rule) => rule.siteId !== id);
       this.sites.delete(id);
+      this.runtime.delete(id);
       await this.notifySitesChanged();
     });
   }
@@ -548,17 +666,27 @@ export class Store {
 
   async saveEvent(
     decision: WafDecision,
-    request: { method: string; path: string; ip?: string | undefined },
-    statusCode?: number
+    request: { method: string; path: string; ip?: string | undefined; siteId?: string; listenPort?: number; policyRevision?: number },
+    statusCode?: number,
+    analysis?: Promise<Partial<WafDecision>>
   ): Promise<void> {
+    if (this.eventWrites.size >= config.eventQueueLimit) { this.droppedEvents += 1; return; }
+    // Include shadow completion in the bounded write set drained during shutdown.
+    const write = (async () => this.persistEvent({ ...decision, ...await analysis }, request, statusCode))();
+    this.eventWrites.add(write);
+    try { await write; } catch (error) { this.eventWriteErrors += 1; throw error; }
+    finally { this.eventWrites.delete(write); }
+  }
+
+  private async persistEvent(decision: WafDecision, request: { method: string; path: string; ip?: string | undefined; siteId?: string; listenPort?: number; policyRevision?: number }, statusCode?: number): Promise<void> {
     const geo = this.geoIp.lookup(request.ip);
     const record: EventRecord = {
-      id: this.events.length + 1,
+      id: 0,
       requestId: decision.requestId,
       action: decision.action,
       mode: decision.mode,
       method: request.method,
-      path: request.path,
+      path: safeRequestPath(request.path),
       ip: request.ip,
       statusCode,
       score: decision.score,
@@ -568,15 +696,26 @@ export class Store {
       ai: decision.ai,
       partialInspection: decision.partialInspection ?? false,
       ...geo,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(), siteId: request.siteId ?? "unknown",
+      ...(request.listenPort === undefined ? {} : { listenPort: request.listenPort }),
+      ...(request.policyRevision === undefined ? {} : { policyRevision: request.policyRevision }),
+      module: decision.module ?? "protocol", localInspectionComplete: decision.localInspectionComplete ?? false,
+      ...(decision.aiInspectionComplete === undefined ? {} : { aiInspectionComplete: decision.aiInspectionComplete }),
+      ...(decision.aiOmittedReason ? { aiOmittedReason: decision.aiOmittedReason } : {}),
+      wouldBlock: decision.wouldBlock ?? false, exceptionIds: decision.exceptionIds ?? []
     };
     if (this.pool) {
       await this.pool.query(
-        `INSERT INTO events
+        `WITH inserted AS (INSERT INTO events
          (request_id, action, mode, method, path, ip, status_code, score, threshold, reason,
-          matched_rules, ai, partial_inspection, country, region, city, latitude, longitude, asn)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-         ON CONFLICT (request_id) WHERE finalized DO NOTHING`,
+          matched_rules, ai, partial_inspection, country, region, city, latitude, longitude, asn, site_id, context)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+         ON CONFLICT (request_id) WHERE finalized DO NOTHING RETURNING action,mode,ai)
+         UPDATE event_totals SET total=total+1, allowed=allowed+(inserted.action='allow')::int,
+           blocked=blocked+(inserted.action='block')::int, errors=errors+(inserted.action='error')::int,
+           ai=event_totals.ai+(inserted.mode='ai')::int, traditional=traditional+(inserted.mode='traditional')::int,
+           hybrid=hybrid+(inserted.mode='hybrid')::int, ai_unavailable=ai_unavailable+COALESCE((inserted.ai->>'available'='false')::int,0)
+         FROM inserted WHERE event_totals.id=1`,
         [
           record.requestId,
           record.action,
@@ -596,12 +735,13 @@ export class Store {
           record.city ?? null,
           record.latitude ?? null,
           record.longitude ?? null,
-          record.asn ?? null
+          record.asn ?? null, record.siteId, JSON.stringify({ listenPort: record.listenPort, policyRevision: record.policyRevision,
+            module: record.module, localInspectionComplete: record.localInspectionComplete, aiInspectionComplete: record.aiInspectionComplete,
+            aiOmittedReason: record.aiOmittedReason, wouldBlock: record.wouldBlock, exceptionIds: record.exceptionIds })
         ]
       );
     } else {
-      const id = this.local!.saveEvent(record);
-      if (id !== undefined) this.events.unshift({ ...record, id });
+      this.local!.saveEvent(record);
     }
   }
 
@@ -610,15 +750,7 @@ export class Store {
     const cursor = filters.cursor ? decodeCursor(filters.cursor) : undefined;
     const safeLimit = Math.min(Math.max(filters.limit ?? 50, 1), 500);
     if (!this.pool) {
-      const filtered = this.events.filter((event) =>
-        (!cursor || event.createdAt < cursor.time || (event.createdAt === cursor.time && BigInt(event.id) < BigInt(cursor.id)))
-        && (!filters.action || event.action === filters.action)
-        && (!filters.ip || event.ip === filters.ip)
-        && (!filters.since || Date.parse(event.createdAt) >= Date.parse(filters.since))
-        && (!filters.until || Date.parse(event.createdAt) <= Date.parse(filters.until))
-        && (!filters.search || [event.path, event.requestId, event.ip ?? ""].some((text) => text.toLowerCase().includes(filters.search!.toLowerCase())))
-      );
-      const page = filtered.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || Number(b.id) - Number(a.id)).slice(0, safeLimit + 1);
+      const page = this.local!.listEvents(filters, cursor);
       const data = page.slice(0, safeLimit);
       return {
         data,
@@ -637,6 +769,7 @@ export class Store {
     }
     if (filters.action) add(`action = ?`, filters.action);
     if (filters.ip) add(`ip = ?`, filters.ip);
+    if (filters.siteId) add(`COALESCE(site_id,'unknown') = ?`, filters.siteId);
     if (filters.since) add(`created_at >= ?::timestamptz`, filters.since);
     if (filters.until) add(`created_at <= ?::timestamptz`, filters.until);
     if (filters.search) add(`strpos(lower(path || ' ' || request_id || ' ' || COALESCE(ip, '')), lower(?)) > 0`, filters.search);
@@ -646,7 +779,7 @@ export class Store {
     const result = await this.pool.query(
       `SELECT id, request_id, action, mode, method, path, ip, status_code, score, threshold,
        reason, matched_rules, ai, partial_inspection, country, region, city, latitude, longitude, asn, created_at,
-       created_at::text AS cursor_time
+       created_at::text AS cursor_time, site_id, context
        FROM events ${where} ORDER BY created_at DESC, id DESC LIMIT ${limitPlaceholder}`,
       values
     );
@@ -661,16 +794,8 @@ export class Store {
   async summary(): Promise<Record<string, number>> {
     if (this.pool) {
       const result = await this.pool.query(`
-        SELECT
-          COUNT(*)::int AS total,
-          COUNT(*) FILTER (WHERE action = 'block')::int AS blocked,
-          COUNT(*) FILTER (WHERE action = 'allow')::int AS allowed,
-          COUNT(*) FILTER (WHERE action = 'error')::int AS errors,
-          COUNT(*) FILTER (WHERE mode = 'ai')::int AS ai,
-          COUNT(*) FILTER (WHERE mode = 'traditional')::int AS traditional,
-          COUNT(*) FILTER (WHERE mode = 'hybrid')::int AS hybrid,
-          COUNT(*) FILTER (WHERE (ai->>'available')::boolean = FALSE)::int AS ai_unavailable
-        FROM events WHERE finalized
+        SELECT total,blocked,allowed,errors,ai,traditional,hybrid,ai_unavailable
+        FROM event_totals WHERE id=1
       `);
       const row = result.rows[0] as Record<string, unknown>;
       return {
@@ -684,7 +809,7 @@ export class Store {
         aiUnavailable: Number(row.ai_unavailable)
       };
     }
-    return summarize(this.events);
+    return this.local!.summary();
   }
 
   async attackMap(hours = 24): Promise<AttackMap> {
@@ -726,45 +851,7 @@ export class Store {
         }))
       };
     }
-    const events = this.events.filter((event) => Date.now() - Date.parse(event.createdAt) <= safeHours * 60 * 60 * 1000 && event.action === "block");
-    const countryCounts = new Map<string, number>();
-    const pointCounts = new Map<string, GeoPoint & { ip?: string | undefined; count: number }>();
-    const attackerCounts = new Map<string, AttackerRecord>();
-    for (const event of events) {
-      const country = event.country ?? "未知地区";
-      countryCounts.set(country, (countryCounts.get(country) ?? 0) + 1);
-      const attacker = attackerCounts.get(event.ip ?? "");
-      const ruleNames = event.matchedRules.flatMap((rule) =>
-        rule && typeof rule === "object" && "name" in rule ? [String(rule.name)] : []);
-      const latest = !attacker || event.createdAt >= attacker.lastSeen;
-      attackerCounts.set(event.ip ?? "", {
-        ip: event.ip, count: (attacker?.count ?? 0) + 1, path: latest ? event.path : attacker.path,
-        rules: [...new Set([...(attacker?.rules ?? []), ...ruleNames])].slice(0, 50),
-        lastSeen: latest ? event.createdAt : attacker.lastSeen, country: event.country,
-        region: event.region, city: event.city, asn: event.asn
-      });
-      if (event.latitude === undefined || event.longitude === undefined) continue;
-      const key = `${event.latitude.toFixed(2)}:${event.longitude.toFixed(2)}`;
-      const previous = pointCounts.get(key);
-      pointCounts.set(key, {
-        latitude: event.latitude,
-        longitude: event.longitude,
-        country: event.country,
-        region: event.region,
-        city: event.city,
-        ip: event.ip,
-        count: (previous?.count ?? 0) + 1
-      });
-    }
-    return {
-      points: [...pointCounts.values()],
-      countries: [...countryCounts.entries()]
-        .map(([name, count]) => ({ name, count }))
-        .sort((left, right) => right.count - left.count)
-        .slice(0, 10),
-      blocked: events.length,
-      attackers: [...attackerCounts.values()].sort((a, b) => b.count - a.count).slice(0, 20)
-    };
+    return this.local!.attackMap(new Date(Date.now() - safeHours * 3600000).toISOString());
   }
 
   async timeseries(hours = 24): Promise<TimeSeriesPoint[]> {
@@ -801,17 +888,7 @@ export class Store {
         }
       }
     } else {
-      for (const event of this.events) {
-        const date = new Date(event.createdAt);
-        if (date < start) continue;
-        date.setMinutes(0, 0, 0);
-        const bucket = buckets.get(date.toISOString());
-        if (!bucket) continue;
-        bucket.total += 1;
-        if (event.action === "allow") bucket.allowed += 1;
-        if (event.action === "block") bucket.blocked += 1;
-        if (event.action === "error") bucket.errors += 1;
-      }
+      for (const point of this.local!.timeseries(start.toISOString())) if (buckets.has(point.time)) buckets.set(point.time, point);
     }
     return [...buckets.values()];
   }
@@ -820,7 +897,7 @@ export class Store {
     return {
       settings: this.settings, initialized: this.initialized, credential: this.credential,
       apiKeyCiphertext: this.apiKeyCiphertext, rules: this.rules, sites: [...this.sites.values()],
-      builtinRuleIds: [...this.builtinRuleIds]
+      builtinRuleIds: [...this.builtinRuleIds], scopedRules: this.scopedRules
     };
   }
 
@@ -841,6 +918,7 @@ export class Store {
       return left.createdAt.localeCompare(right.createdAt);
     });
     for (const site of ordered) {
+      if (site.id === "default") site.listenPort = config.proxyPort;
       if (!isSitePort(site.listenPort) || used.has(site.listenPort)) {
         site.listenPort = this.findAvailableSitePort(used);
       }
@@ -865,17 +943,41 @@ export class Store {
 
   private async persistSiteCompatibilityFields(): Promise<void> {
     if (!this.pool) return;
-    for (const site of this.sites.values()) {
-      await this.pool.query(
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE sites SET listen_port=NULL");
+      for (const site of this.sites.values()) await client.query(
         `UPDATE sites SET listen_port = $1, mode = $2 WHERE id = $3`,
         [site.listenPort, site.mode, site.id]
       );
-    }
-    await this.pool.query(`UPDATE settings SET mode = $1 WHERE id = 1`, [this.settings.mode]);
+      await client.query(`UPDATE settings SET mode = $1 WHERE id = 1`, [this.settings.mode]);
+      await client.query("COMMIT");
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
 
   private async notifySitesChanged(): Promise<void> {
     await this.siteChangeListener?.();
+  }
+
+  eventRuntime() { return { queueDepth: this.eventWrites.size, queueLimit: config.eventQueueLimit,
+    droppedEvents: this.droppedEvents, writeErrors: this.eventWriteErrors, retentionDays: config.logRetentionDays }; }
+
+  pruneEvents(cutoff = new Date(Date.now() - config.logRetentionDays * 86400000).toISOString()): Promise<number> {
+    if (this.retentionWork) return this.retentionWork;
+    const work = (async () => {
+      if (this.local) return this.local.retention(cutoff);
+      const result = await this.pool!.query("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE created_at < $1::timestamptz ORDER BY id LIMIT 1000)", [cutoff]);
+      return result.rowCount ?? 0;
+    })();
+    this.retentionWork = work;
+    void work.finally(() => { this.retentionWork = undefined; }).catch(() => {});
+    return work;
+  }
+
+  private startRetention(): void {
+    this.retentionTimer = setInterval(() => { void this.pruneEvents().catch(() => { this.eventWriteErrors += 1; }); }, 60000);
+    this.retentionTimer.unref();
   }
 
   private serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -885,7 +987,10 @@ export class Store {
   }
 
   async close(): Promise<void> {
+    clearInterval(this.retentionTimer);
     await this.mutationQueue;
+    await Promise.allSettled([...this.eventWrites]);
+    await this.retentionWork?.catch(() => {});
     this.local?.close();
     await this.pool?.end();
   }
@@ -1005,7 +1110,8 @@ function mapSite(row: QueryResultRow): Site {
     upstreamUrl: String(row.upstream_url),
     mode: row.mode as ProtectionMode,
     enabled: Boolean(row.enabled),
-    createdAt: new Date(row.created_at as string).toISOString()
+    createdAt: new Date(row.created_at as string).toISOString(), policy: row.policy ? parsePolicy(row.policy) : null,
+    revision: Number(row.revision ?? 1)
   };
 }
 
@@ -1028,6 +1134,7 @@ function effectiveProtectionMode(mode: ProtectionMode, aiConfigured: boolean): P
 
 function mapEvent(row: QueryResultRow): EventRecord {
   return {
+    ...(row.context as Partial<EventRecord> ?? {}), siteId: String(row.site_id ?? "unknown"),
     id: row.id as string | number,
     requestId: String(row.request_id ?? ""),
     action: String(row.action),

@@ -1,6 +1,6 @@
 # 鉴流（JianFlow WAF）
 
-鉴流是一个面向自托管场景的 Web 应用防火墙。它把本地规则、Jev AI 判断和可追溯的请求事件放在同一条防护链路里，适合需要自己掌握数据、策略和部署方式的团队。
+鉴流是一个面向 Linux 自托管的 Web 应用防火墙，以本地规则为基础，可选接入 Jev AI。它按端口管理多个站点，提供站点策略、限速和请求事件，适合希望查看、修改防护代码的开发者和小团队。
 
 [![License: MIT](https://img.shields.io/github/license/wrhc2010/JianFlow-WAF)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/wrhc2010/JianFlow-WAF)](https://github.com/wrhc2010/JianFlow-WAF/releases)
@@ -12,21 +12,23 @@
 项目提供三种防护模式：
 
 - **传统规则**：只使用本地规则引擎，行为稳定、延迟低。
-- **AI 判断**：使用 Jev 返回的恶意概率和拦截阈值做决策。
-- **混合模式**：先用本地规则拦截明显攻击，再让 Jev 复核剩余请求。
+- **AI 判断**：使用 Jev 返回的风险分数和拦截阈值做决策，强制访问控制和协议限制仍然生效。
+- **混合模式**：先检查本地规则，默认只让 Jev 复核规则记录的可疑请求，也可选择全部请求或影子评估。
 
 这不是一个“开箱即替代所有安全设备”的黑盒。正式接入生产流量前，仍应结合自身业务做安全审计、压力测试和灰度验证。
 
 ## 这版重点
 
-`v0.2.1` 在 `v0.2.0` 的基础上补齐了多站点入口和配置保存流程：
+`v0.2.2` 增加了站点策略和误报调优，并修复 HTTPS 启停、AI 响应校验及出站脱敏问题：
 
 - 站点按监听端口区分入口，默认可用端口为 `8080-8099`，每个端口可以指向不同上游并使用不同防护模式。
 - “防护策略”和站点表单都采用草稿 + 保存/取消，避免输入过程中直接改动服务端配置。
 - 没有配置 Jev key 时，AI 和混合模式在 WebUI 中不可选，API 也会回退到传统规则。
 - 固定侧边栏高度，右侧内容独立滚动；站点页面改为卡片网格，适合查看多个入口。
-- 全量事件统计，支持游标分页、搜索、动作、IP 和时间筛选。
-- 10%、30%、50%、70%、90% 五档阈值，并支持自定义阈值。
+- 站点可继承全局策略或独立配置阈值、观察模式、停用规则和 AI 行为。
+- 按站点、方法、完整路径、字段和规则 ID 配置有期限的精确例外，支持样本回放；访问控制和业务 CC 限速不受例外或观察模式影响。
+- 事件记录站点、策略版本、命中字段及检查范围；详情按保留天数清理，独立计数保留历史总计。
+- 10%、30%、50%、70%、90% 五档拦截阈值及自定义值。阈值越低，拦截越多，已有数值不变。
 - 检查路径、查询参数、请求头、Cookie、IP 和完整请求体。
 - 支持 JSON、表单、XML、multipart、纯文本，以及 gzip、deflate 和 brotli 请求体。
 - 对重复编码、Unicode 变体、危险 URL、内网目标和常见注入语法做规范化检查。
@@ -42,7 +44,7 @@
 
 ## 在 Linux 上部署
 
-以下步骤面向 Linux 服务器，命令使用 Bash，配置对应 `v0.2.1`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
+以下步骤面向 Linux 服务器，命令使用 Bash，配置对应 `v0.2.2`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
 
 需要 Git、curl、OpenSSL，以及已安装并运行的 Docker Engine 和 Docker Compose v2。使用容器部署不需要在宿主机安装 Node.js。
 
@@ -84,7 +86,13 @@ docker compose ps
 curl -fsS http://127.0.0.1:4000/api/v1/health
 ```
 
-等待服务健康检查通过后，健康接口应返回包含 `"ok": true` 的 JSON。在浏览器中打开 `http://服务器地址:3000` 完成初始化。
+等待服务健康检查通过后，健康接口应返回包含 `"ok": true` 的 JSON。管理端口默认只绑定服务器回环地址；远程管理可先建立 SSH 隧道：
+
+```bash
+ssh -L 3000:127.0.0.1:3000 user@server
+```
+
+随后在本地浏览器打开 `http://127.0.0.1:3000` 完成初始化。`/api/v1/health/live` 检查进程存活，`/api/v1/health/ready` 检查启用入口及策略版本是否实际应用。
 
 | 入口 | 端口 | 用途 |
 | --- | ---: | --- |
@@ -93,13 +101,15 @@ curl -fsS http://127.0.0.1:4000/api/v1/health
 | WAF HTTP | 8080-8099 | 按站点分配的 HTTP 入口 |
 | WAF HTTPS | 8443 | 配置证书后使用 |
 
-当前 Compose 将上述端口发布到宿主机所有接口，PostgreSQL 不对宿主机开放。请限制管理后台和 API 的访问来源；公网管理入口应放在可信的 HTTPS 反向代理后，不要直接开放 `3000` 和 `4000`。
+Compose 将 `3000` 和 `4000` 绑定到 `127.0.0.1`，WAF 入口发布到所有接口，PostgreSQL 不对宿主机开放。需要远程多人管理时，使用受控的 HTTPS 反向代理；不要直接把管理端口暴露到公网。
 
 Compose 使用文件型 Docker secret 提供 PostgreSQL 密码。可以通过 `POSTGRES_PASSWORD_FILE_SOURCE` 指向已有密码文件；显式设置 `DATABASE_URL` 时，API 会优先使用它。PostgreSQL 数据和 API 数据目录由命名卷持久化，GeoIP 文件从宿主机 `GEOIP_DIR` 只读挂载。
 
 ### 配置多个入口
 
-默认站点固定使用 `8080`。在“站点与上游”页面新建站点时，从当前范围内选择未占用端口，填写上游地址和防护模式。保存后，API 会为启用站点动态监听对应端口；停用站点后，该端口不再接收代理流量。
+默认站点固定使用 `8080`。在“站点与上游”页面新建站点时，从当前范围内选择未占用端口，填写上游地址和防护模式。保存后动态应用监听器；卡片分别显示期望版本和实际版本，端口占用或证书加载失败会显示应用失败，可重试。停用默认站点会同时关闭其 HTTP 和 HTTPS 入口。
+
+站点可继承全局策略，也可覆盖阈值、执行方式、停用规则、AI 数据范围和限速。观察模式保留命中及“原本会拦截”的记录，但不阻断检测命中；强制 ACL、协议校验、正文上限和 CC 限速仍会拒绝请求。限速是单进程内的每站点、每 IP 令牌桶和并发限制，不是分布式限流或 Bot 挑战。
 
 `SITE_PORT_RANGE` 只在部署启动时读取，范围必须包含默认入口 `8080`。例如扩展到 `8080-8109`，修改 `.env` 后重启；仓库中的 Compose 会按这个变量发布端口。如果使用了自定义端口映射，也要同步调整：
 
@@ -111,15 +121,19 @@ SITE_PORT_RANGE=8080-8109
 
 ### 使用发布镜像
 
-不想在服务器构建时，可以从 [v0.2.1 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.1) 下载 API 和 Web 镜像压缩包。先按上面的步骤准备配置和密码文件，再导入镜像：
+不想在服务器构建时，可以从 [v0.2.2 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.2) 下载 API 和 Web 镜像压缩包。先按上面的步骤准备配置和密码文件，再导入镜像：
 
 ```bash
-docker load -i jianflow-waf-api-v0.2.1.tar.gz
-docker load -i jianflow-waf-web-v0.2.1.tar.gz
-IMAGE_TAG=v0.2.1 docker compose up -d --no-build --pull never
+sha256sum -c jianflow-waf-api-v0.2.2.tar.gz.sha256
+sha256sum -c jianflow-waf-web-v0.2.2.tar.gz.sha256
+docker load -i jianflow-waf-api-v0.2.2.tar.gz
+docker load -i jianflow-waf-web-v0.2.2.tar.gz
+IMAGE_TAG=v0.2.2 docker compose up -d --no-build --pull never
 ```
 
 `--pull never` 不会下载缺失的镜像；如果本机还没有 PostgreSQL 镜像，先运行 `docker pull postgres:16-alpine`。
+
+请同时下载对应的 `.sha256` 文件。GHCR 是否允许匿名拉取取决于 GitHub 包权限；这里以 Release 镜像包作为不需要 GHCR 登录的部署入口。
 
 ### 日志和日常维护
 
@@ -182,18 +196,22 @@ JEV_BASE_URL=https://openrouter.ai
 
 没有 key 时仍然可以完成首次初始化，但 WebUI 和 API 都只允许传统规则模式。配置 key 并保存后，才可以选择 AI 或混合模式。AI 模式在 Jev 不可用时会记录错误并阻断；混合模式会在传统规则通过后按传统结果降级，同时保留 AI 不可用信息。
 
-默认阈值如下：
+Jev 分数不是经过本项目校准的真实恶意概率。阈值越低，越容易拦截；本版仅修正显示名称，不翻转已有配置：
 
-| 强度 | Jev 概率达到该值时拦截 |
+| 配置值 | Jev 风险分数达到该值时拦截 |
 | --- | ---: |
-| 极低 | 10% |
-| 低 | 30% |
-| 中 | 50% |
-| 高 | 70% |
-| 极高 | 90% |
+| veryLow | 10% |
+| low | 30% |
+| medium | 50% |
+| high | 70% |
+| extreme | 90% |
 | 自定义 | 0% - 100% |
 
-发送给 Jev 的内容会按字段脱敏：凭据请求头、常见敏感查询参数、JSON 和表单字段会遮蔽值；XML、纯文本和 multipart body 会在限制范围内参与检查。脱敏不是隐私保证，不要把真实客户数据直接用于测试。
+默认不向 AI 发送正文业务字段的值。策略中的 `aiBodyFields` 可允许 JSON 点路径或表单字段出站，`*` 表示允许全部可解析字段；识别到的凭据仍会遮蔽。`application/*+json` 和 JSON Patch 使用结构化脱敏，XML、纯文本、multipart 和未知格式不发送正文给 AI，但仍接受完整本地检测。路径和查询串中的常见凭据也会脱敏。脱敏不能保证识别所有业务秘密，不要用真实客户数据测试。
+
+事件分别记录本地和 AI 检查是否完整，以及 AI 省略正文的原因。默认在 AI 正文不完整时继续本地结果，可按站点改为拒绝。影子评估不改变代理响应，AI 结果异步合入该请求的最终事件。
+
+AI 调用没有等待队列，默认最多 8 个并发、每分钟 120 次，另有每站点预算；连续 5 次失败后熔断 30 秒。可通过 `AI_MAX_CONCURRENT`、`AI_REQUESTS_PER_MINUTE` 调整，超时仍使用 `AI_TIMEOUT_MS`。代理全局并发使用 `MAX_PROXY_CONCURRENT`，IP 状态上限使用 `MAX_TRACKED_CLIENTS`，事件待写上限使用 `EVENT_QUEUE_LIMIT`。
 
 ## 初始化、规则和 GeoIP
 
@@ -228,6 +246,8 @@ Docker 部署时，把文件放在宿主机的 `./geoip`，并使用上文的 `/
 
 一个请求只保存一个最终事件，避免先记录 allow、再记录上游 error 造成重复统计。
 
+`LOG_RETENTION_DAYS` 默认 30，每分钟最多清理 1000 条过期详情，大量历史数据需要多轮清理。趋势和地图只统计当前保留详情；历史总计由独立计数保存，不会随详情删除减少。SQLite 使用索引和 SQL 分页，不再把全部历史事件读入内存。系统信息提供事件待写、丢弃及写入错误计数，达到队列上限时可能丢失详情。
+
 ## 验证
 
 ```bash
@@ -242,7 +262,7 @@ npm test
 curl -i 'http://127.0.0.1:8080/search?q=union+select+password+from+users'
 ```
 
-默认混合模式下，预期返回 `403`，不需要上游或 Jev 在线。普通请求返回 `502` 时，先检查 `UPSTREAM_URL` 和上游服务的监听地址；服务启动异常可查看 `docker compose logs --tail=100 api postgres`。
+在传统规则或启用阻断的混合模式下，预期返回 `403`，不需要上游或 Jev 在线。普通请求返回 `502` 时，先检查 `UPSTREAM_URL` 和上游服务的监听地址；服务启动异常可查看 `docker compose logs --tail=100 api postgres`。
 
 管理 API 需要先通过 `/api/v1/auth/login` 获取 HttpOnly 会话 Cookie。正式版验证还覆盖 PostgreSQL 迁移、站点端口持久化、动态监听器、按端口转发、重启持久化、压缩请求、请求头攻击、可信代理 IP、规则导入原子性、2D/3D 地图和 WebGL 回退。
 

@@ -7,11 +7,13 @@ import { randomUUID } from "node:crypto";
 import { brotliDecompress, gunzip, inflate } from "node:zlib";
 import { promisify } from "node:util";
 import httpProxy from "http-proxy";
-import { evaluateRequest, isIpInCidr, type WafDecision, type WafRequest } from "@jev-waf/core";
+import { BUILTIN_RULES, evaluateRequest, evaluateRules, defaultPolicy, buildAiInspection, thresholdFor, isIpInCidr,
+  type WafDecision, type WafRequest, type SitePolicy, type AccessRule, type RuleException } from "@jev-waf/core";
 import { config } from "./config.js";
-import { classifyWithJev } from "./jev.js";
-import { Store } from "./db/store.js";
+import { classifyWithJev, aiRuntime } from "./jev.js";
+import { Store, type Site } from "./db/store.js";
 import { inspectBody } from "./body-inspection.js";
+import { TrafficControl } from "./traffic-control.js";
 export { isIpInCidr } from "@jev-waf/core";
 
 const proxy = httpProxy.createProxyServer({ changeOrigin: true, xfwd: false, proxyTimeout: 30000 });
@@ -44,6 +46,14 @@ const clientControlledRoutingHeaders = [
   "x-rewrite-url",
   "x-http-method-override"
 ];
+const controls = new WeakMap<Store, TrafficControl>();
+const builtinIds = new Set(BUILTIN_RULES.map((rule) => rule.id));
+function control(store: Store): TrafficControl {
+  let value = controls.get(store);
+  if (!value) { value = new TrafficControl(); controls.set(store, value); }
+  return value;
+}
+export function trafficRuntime(store: Store) { return control(store).snapshot(); }
 
 function headersOf(request: http.IncomingHttpHeaders): Record<string, string> {
   return Object.fromEntries(
@@ -199,13 +209,14 @@ function forwardHeaders(request: http.IncomingMessage, wafRequest: WafRequest): 
   request.headers["x-forwarded-proto"] = "encrypted" in request.socket && Boolean(request.socket.encrypted) ? "https" : "http";
 }
 
-function eventSaver(store: Store, request: WafRequest): (decision: WafDecision, status: number) => Promise<void> {
+function eventSaver(store: Store, request: WafRequest, site?: Site, shadow?: () => Promise<Partial<WafDecision>> | undefined): (decision: WafDecision, status: number) => Promise<void> {
   let saved = false;
   return async (decision, status) => {
     if (saved) return;
     saved = true;
     try {
-      await store.saveEvent(decision, { method: request.method, path: `${request.path}${request.query}`, ip: request.ip }, status);
+      await store.saveEvent(decision, { method: request.method, path: `${request.path}${request.query}`, ip: request.ip,
+        ...(site ? { siteId: site.id, listenPort: site.listenPort, policyRevision: site.revision ?? 1 } : {}) }, status, shadow?.());
     } catch {
       console.error(`Failed to persist WAF event ${decision.requestId}`);
     }
@@ -220,23 +231,68 @@ proxy.on("proxyRes", (upstream, request) => {
 
 function settingsForPort(store: Store, listenPort?: number) {
   const settings = store.getSettings();
-  if (listenPort === undefined || typeof store.getSiteByPort !== "function") return settings;
-  const site = store.getSiteByPort(listenPort);
-  return site ? { ...settings, mode: site.mode, upstreamUrl: site.upstreamUrl } : settings;
+  if (typeof store.getSiteByPort !== "function") return { settings, policy: defaultPolicy(), site: undefined };
+  const site = store.getSiteByPort(listenPort ?? config.proxyPort);
+  if (!site || !site.enabled) return undefined;
+  const policy = store.effectivePolicy?.(site) ?? { ...defaultPolicy(), strength: settings.strength, customThreshold: settings.customThreshold };
+  return { settings: { ...settings, mode: site.mode, upstreamUrl: site.upstreamUrl, strength: policy.strength, customThreshold: policy.customThreshold }, policy, site };
+}
+
+function accessDecision(store: Store, request: WafRequest, mode: WafDecision["mode"], requestId: string): { decision?: WafDecision; skip: boolean } {
+  const access = (store.listScopedRules?.(request.siteId ?? "", "access-rules") ?? []) as AccessRule[];
+  const matches = access.filter((entry) => entry.enabled && Date.parse(entry.expiresAt) > Date.now()
+    && (entry.method === "*" || entry.method === request.method) && (entry.path === "*" || entry.path === request.path)
+    && isIpInCidr(request.ip ?? "", entry.cidr));
+  const critical = evaluateRules(request, store.listRules().filter((rule) => rule.enabled && rule.action === "block"
+    && (rule.target === "ip" || !builtinIds.has(rule.id) && ["path", "method"].includes(rule.target))));
+  if (matches.some((entry) => entry.action === "block") || critical.length) return { skip: false, decision: {
+    action: "block", mode, requestId, matchedRules: critical, reason: "访问控制拒绝", module: "acl", localInspectionComplete: false
+  } };
+  return { skip: matches.some((entry) => entry.action === "skip-detection") };
+}
+
+async function inspectRequest(store: Store, request: WafRequest, resolved: NonNullable<ReturnType<typeof settingsForPort>>, requestId: string, skip: boolean) {
+  const { settings, policy, site } = resolved;
+  if (skip) return { decision: { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "访问控制：跳过检测", module: "acl", localInspectionComplete: false } as WafDecision };
+  const exceptions = (store.listScopedRules?.(site?.id ?? "", "exceptions") ?? []) as RuleException[];
+  const classify = (state: string, model: string, timeout: number) => classifyWithJev(state, model, timeout, site?.id);
+  if (policy.aiBehavior !== "shadow" || settings.mode === "traditional") return {
+    decision: await evaluateRequest(request, store.listRules(), settings, requestId, classify, { policy, exceptions })
+  };
+  const decision = await evaluateRequest(request, store.listRules(), { ...settings, mode: "traditional" }, requestId, classify, { policy, exceptions });
+  decision.mode = settings.mode;
+  if (decision.action !== "allow" || policy.aiScope === "suspicious" && !decision.matchedRules.length) return { decision };
+  const inspection = buildAiInspection(request, settings.aiBodyLimit, policy.aiBodyFields);
+  // Shadow work has no waiting queue; admission and provider timeout bound its lifetime.
+  const shadow = aiRuntime().active >= config.aiMaxConcurrent
+    ? Promise.resolve({ aiInspectionComplete: false, aiOmittedReason: "concurrency_limit" } as Partial<WafDecision>)
+    : classify(inspection.state, settings.model, settings.aiTimeoutMs).then((ai): Partial<WafDecision> => ({ ai,
+      ...(ai.available ? { score: ai.noul } : {}), threshold: thresholdFor(settings),
+      aiInspectionComplete: inspection.complete, ...(inspection.omittedReason ? { aiOmittedReason: inspection.omittedReason } : {}),
+      partialInspection: !inspection.complete, module: "rules+ai-shadow"
+    }));
+  return { decision, shadow };
 }
 
 async function handleProxyRequest(store: Store, request: http.IncomingMessage, response: http.ServerResponse, listenPort?: number): Promise<void> {
   const requestId = randomUUID();
-  const settings = settingsForPort(store, listenPort);
+  const resolved = settingsForPort(store, listenPort);
+  if (!resolved) { request.resume(); blockResponse(response, 503, "入口不存在或已停用", requestId); return; }
+  const { settings, policy, site } = resolved;
   const wafRequest = requestOf(request);
-  const saveOnce = eventSaver(store, wafRequest);
+  if (site) wafRequest.siteId = site.id;
+  let shadow: Promise<Partial<WafDecision>> | undefined;
+  const saveOnce = eventSaver(store, wafRequest, site, () => shadow);
+  let release = () => {};
   let decision = inspectionFailure(settings.mode, requestId, "请求尚未完成检查");
   response.once("finish", () => {
+    release();
     const status = response.statusCode || 502;
     if (status >= 500 && decision.action === "allow") decision = { ...decision, action: "error", reason: `上游返回 HTTP ${status}` };
     void saveOnce(decision, status);
   });
   response.once("close", () => {
+    release();
     if (!response.writableFinished) void saveOnce({ ...decision, action: "error", reason: "响应传输中断" }, 499);
   });
   request.setTimeout(15000, () => {
@@ -248,14 +304,26 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
   try {
     validateRequestFraming(request);
     splitRequestTarget(wafRequest);
+    const access = accessDecision(store, wafRequest, settings.mode, requestId);
+    if (access.decision) { decision = access.decision; request.resume(); blockResponse(response, 403, decision.reason, requestId); return; }
+    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy);
+    release = admission.release;
+    if (!admission.allowed) {
+      decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: admission.reason ?? "限速", module: "cc", localInspectionComplete: false };
+      request.resume(); response.setHeader("retry-after", admission.retryAfter ?? 1);
+      blockResponse(response, 429, decision.reason, requestId); return;
+    }
     const body = await readBody(request);
     request.setTimeout(0);
     if (response.destroyed) return;
     wafRequest.body = body.body;
     if (body.fields) wafRequest.bodyFields = body.fields;
-    decision = body.error
-      ? inspectionFailure(settings.mode, requestId, body.error)
-      : await evaluateRequest(wafRequest, store.listRules(), settings, requestId, classifyWithJev);
+    if (body.error) decision = inspectionFailure(settings.mode, requestId, body.error);
+    else {
+      const result = await inspectRequest(store, wafRequest, resolved, requestId, access.skip);
+      decision = result.decision;
+      shadow = result.shadow;
+    }
     decision.partialInspection = body.partial || Boolean(decision.partialInspection);
     if (response.destroyed) return;
     if (decision.action !== "allow") {
@@ -288,13 +356,19 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
 }
 
 async function handleUpgrade(store: Store, request: http.IncomingMessage, socket: Duplex, head: Buffer, listenPort?: number): Promise<void> {
-  const settings = settingsForPort(store, listenPort);
   const requestId = randomUUID();
+  const resolved = settingsForPort(store, listenPort);
+  if (!resolved) { upgradeBlock(socket, 503, requestId); return; }
+  const { settings, policy, site } = resolved;
   const wafRequest = requestOf(request);
-  const saveOnce = eventSaver(store, wafRequest);
+  if (site) wafRequest.siteId = site.id;
+  let shadow: Promise<Partial<WafDecision>> | undefined;
+  const saveOnce = eventSaver(store, wafRequest, site, () => shadow);
+  let release = () => {};
   let decision = inspectionFailure(settings.mode, requestId, "WebSocket 握手尚未完成");
   let upgraded = false;
   socket.once("close", () => {
+    release();
     if (!upgraded) void saveOnce({ ...decision, action: "error", reason: "WebSocket 握手中断" }, 499);
   });
   try {
@@ -303,7 +377,18 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
       || request.headers["transfer-encoding"] || Number(request.headers["content-length"] ?? 0) !== 0) {
       throw new Error("WebSocket 握手格式无效");
     }
-    decision = await evaluateRequest(wafRequest, store.listRules(), settings, requestId, classifyWithJev);
+    validateRequestFraming(request);
+    const access = accessDecision(store, wafRequest, settings.mode, requestId);
+    if (access.decision) { decision = access.decision; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
+    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy);
+    release = admission.release;
+    if (!admission.allowed) {
+      decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: admission.reason ?? "限速", module: "cc" };
+      await saveOnce(decision, 429); upgradeBlock(socket, 429, requestId); return;
+    }
+    const result = await inspectRequest(store, wafRequest, resolved, requestId, access.skip);
+    decision = result.decision;
+    shadow = result.shadow;
     if (socket.destroyed) return;
     if (decision.action !== "allow") {
       const status = decision.action === "block" ? 403 : 503;

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import Fastify from "fastify";
+import Fastify, { type FastifyReply } from "fastify";
 import cookie from "@fastify/cookie";
 import websocket from "@fastify/websocket";
 import rateLimit from "@fastify/rate-limit";
@@ -20,6 +20,14 @@ import { parseRuleImport, RuleImportError, validateRule } from "./rule-import.js
 import { Store, type EventFilters } from "./db/store.js";
 import { classifyWithJev } from "./jev.js";
 import { ConflictError, SetupConflictError, ValidationError } from "./errors.js";
+import { policySchema, parsePolicy } from "./policy-validation.js";
+import { aiRuntime } from "./jev.js";
+import { trafficRuntime } from "./proxy.js";
+import type { SitePolicy, RuleException, AccessRule } from "@jev-waf/core";
+
+function notFound(reply: FastifyReply, detail: string, instance: string) {
+  return reply.code(404).type("application/problem+json").send({ type: "about:blank", title: "Not Found", status: 404, detail, instance });
+}
 
 export async function createApp(store: Store, logger = true) {
   const app = Fastify({
@@ -51,7 +59,7 @@ export async function createApp(store: Store, logger = true) {
             : 500;
     if (status >= 500)
       request.log.error({ err: failure }, "Management request failed");
-    return reply.code(status).send({
+    return reply.code(status).type("application/problem+json").send({
       type: "about:blank",
       title: status >= 500 ? "Storage error" : "Validation error",
       status,
@@ -69,6 +77,11 @@ export async function createApp(store: Store, logger = true) {
       setup: store.setupStatus(),
       timestamp: new Date().toISOString(),
     });
+  });
+  app.get("/api/v1/health/live", async () => ({ ok: true }));
+  app.get("/api/v1/health/ready", async (_request, reply) => {
+    const ok = await store.health() && store.readiness();
+    return reply.code(ok ? 200 : 503).send({ ok });
   });
 
   app.get("/api/v1/setup/status", async () => store.setupStatus());
@@ -209,11 +222,13 @@ export async function createApp(store: Store, logger = true) {
 
   app.get("/api/v1/dashboard/summary", async () => store.summary());
   app.get("/api/v1/system", async () => ({
-    proxyPort: config.proxyPort, apiPort: config.apiPort,
+    proxyPort: config.proxyPort, apiPort: config.apiPort, httpsPort: config.httpsPort,
     sitePortRange: config.sitePortRange,
     maxRequestBodyBytes: config.maxRequestBodyBytes,
-    httpsEnabled: Boolean(config.tlsKeyPath && config.tlsCertPath),
+    httpsConfigured: Boolean(config.tlsKeyPath && config.tlsCertPath),
+    httpsEnabled: Boolean(config.tlsKeyPath && config.tlsCertPath) && store.listSites().some((site) => site.id === "default" && site.enabled && site.runtime?.state === "active"),
     geoIpAsnConfigured: Boolean(config.geoIpAsnDatabasePath),
+    ready: store.readiness(), aiRuntime: aiRuntime(), events: store.eventRuntime(), traffic: trafficRuntime(store),
     ...store.setupStatus()
   }));
   app.get("/api/v1/dashboard/attack-map", async (request) => {
@@ -243,6 +258,7 @@ export async function createApp(store: Store, logger = true) {
             since: { type: "string", format: "date-time" },
             until: { type: "string", format: "date-time" },
             search: { type: "string", maxLength: 256 },
+            siteId: { type: "string", minLength: 1, maxLength: 256 },
           },
         },
       },
@@ -266,6 +282,7 @@ export async function createApp(store: Store, logger = true) {
         ...(query.since ? { since: query.since } : {}),
         ...(query.until ? { until: query.until } : {}),
         ...(query.search ? { search: query.search } : {}),
+        ...(query.siteId ? { siteId: query.siteId } : {}),
       });
     },
   );
@@ -280,6 +297,7 @@ export async function createApp(store: Store, logger = true) {
           additionalProperties: false,
           properties: {
             mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
+            defaultPolicy: policySchema,
             strength: {
               type: "string",
               enum: ["veryLow", "low", "medium", "high", "extreme", "custom"],
@@ -302,6 +320,7 @@ export async function createApp(store: Store, logger = true) {
     async (request, reply) => {
       const body = request.body ?? {};
       const nextSettings: Parameters<Store["updateSettings"]>[0] = {};
+      if (body.defaultPolicy !== undefined) nextSettings.defaultPolicy = parsePolicy(body.defaultPolicy);
       if (body.mode !== undefined)
         nextSettings.mode = body.mode as ProtectionMode;
       if (body.strength !== undefined)
@@ -377,6 +396,7 @@ export async function createApp(store: Store, logger = true) {
       upstreamUrl?: string;
       mode?: ProtectionMode;
       enabled?: boolean;
+      policy?: SitePolicy | null;
     };
   }>("/api/v1/sites", {
     schema: {
@@ -390,6 +410,7 @@ export async function createApp(store: Store, logger = true) {
           upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
           mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
           enabled: { type: "boolean" }
+          ,policy: { anyOf: [policySchema, { type: "null" }] }
         }
       }
     }
@@ -408,6 +429,7 @@ export async function createApp(store: Store, logger = true) {
       upstreamUrl: body.upstreamUrl,
       mode: body.mode ?? "hybrid",
       enabled: body.enabled ?? true,
+      ...(body.policy === undefined ? {} : { policy: body.policy }),
     });
     return reply.code(201).send(site);
   });
@@ -419,6 +441,7 @@ export async function createApp(store: Store, logger = true) {
       upstreamUrl?: string;
       mode?: ProtectionMode;
       enabled?: boolean;
+      policy?: SitePolicy | null;
     };
   }>("/api/v1/sites/:id", {
     schema: {
@@ -432,15 +455,14 @@ export async function createApp(store: Store, logger = true) {
           upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
           mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
           enabled: { type: "boolean" }
+          ,policy: { anyOf: [policySchema, { type: "null" }] }
         }
       }
     }
   }, async (request, reply) => {
     const current = store.listSites().find((site) => site.id === request.params.id);
     if (!current) {
-      return reply.code(404).send({
-        type: "about:blank", title: "Not found", status: 404, detail: "站点不存在"
-      });
+      return notFound(reply, "站点不存在", request.url);
     }
     const site = await store.saveSite({ ...current, ...request.body, id: current.id });
     return site;
@@ -449,13 +471,64 @@ export async function createApp(store: Store, logger = true) {
     "/api/v1/sites/:id",
     async (request, reply) => {
       if (!store.listSites().some((site) => site.id === request.params.id)) {
-        return reply.code(404).send({
-          type: "about:blank", title: "Not found", status: 404, detail: "站点不存在"
-        });
+        return notFound(reply, "站点不存在", request.url);
       }
       await store.deleteSite(request.params.id);
       return { ok: true };
     },
+  );
+
+  app.post("/api/v1/listener-reloads", async (_request, reply) => {
+    await store.retryListeners();
+    return reply.code(201).send({ data: store.listSites(), ready: store.readiness() });
+  });
+
+  for (const kind of ["exceptions", "access-rules"] as const) {
+    const path = `/api/v1/sites/:siteId/${kind}`;
+    app.get<{ Params: { siteId: string }; Querystring: { limit?: number; offset?: number } }>(path, {
+      schema: { querystring: { type: "object", additionalProperties: false, properties: {
+        limit: { type: "integer", minimum: 1, maximum: 100 }, offset: { type: "integer", minimum: 0, maximum: 500 }
+      } } }
+    }, async (request, reply) => {
+      if (!store.listSites().some((site) => site.id === request.params.siteId)) return notFound(reply, "站点不存在", request.url);
+      const entries = store.listScopedRules(request.params.siteId, kind);
+      const offset = request.query.offset ?? 0, limit = request.query.limit ?? 100;
+      return { data: entries.slice(offset, offset + limit), pagination: { total: entries.length, offset, limit } };
+    });
+    app.post<{ Params: { siteId: string }; Body: unknown }>(path, async (request, reply) => {
+      if (!store.listSites().some((site) => site.id === request.params.siteId)) return notFound(reply, "站点不存在", request.url);
+      const rule = await store.saveScopedRule(request.params.siteId, kind, request.body);
+      return reply.code(201).header("location", `/api/v1/sites/${request.params.siteId}/${kind}/${rule.id}`).send(rule);
+    });
+    app.patch<{ Params: { siteId: string; id: string }; Body: Record<string, unknown> }>(`${path}/:id`, async (request, reply) => {
+      const current = store.listScopedRules(request.params.siteId, kind).find((rule) => rule.id === request.params.id);
+      if (!current) return notFound(reply, "配置不存在", request.url);
+      const { siteId: _siteId, id: _id, ...editable } = current;
+      return store.saveScopedRule(request.params.siteId, kind, { ...editable, ...request.body }, current.id);
+    });
+    app.delete<{ Params: { siteId: string; id: string } }>(`${path}/:id`, async (request, reply) => {
+      if (!store.listScopedRules(request.params.siteId, kind).some((rule) => rule.id === request.params.id)) return notFound(reply, "配置不存在", request.url);
+      await store.deleteScopedRule(request.params.siteId, request.params.id);
+      return { ok: true };
+    });
+  }
+
+  app.post<{ Params: { siteId: string }; Body: { method: string; path: string; query?: string; headers?: Record<string, string>; body?: string; exception?: Omit<RuleException, "id" | "siteId"> } }>(
+    "/api/v1/sites/:siteId/exception-previews", {
+      schema: { body: { type: "object", required: ["method", "path"], additionalProperties: false, properties: {
+        method: { type: "string", minLength: 1, maxLength: 32 }, path: { type: "string", minLength: 1, maxLength: 1024 },
+        query: { type: "string", maxLength: 65536 }, body: { type: "string", maxLength: 524288 },
+        headers: { type: "object", maxProperties: 100, additionalProperties: { type: "string", maxLength: 65536 } }, exception: { type: "object" }
+      } } }
+    }, async (request, reply) => {
+      if (!store.listSites().some((site) => site.id === request.params.siteId)) return notFound(reply, "站点不存在", request.url);
+      const { exception, ...sample } = request.body;
+      const wafRequest = { ...sample, query: sample.query ?? "", headers: sample.headers ?? {}, siteId: request.params.siteId };
+      const { parseScopedRule } = await import("./policy-validation.js");
+      const exceptions = store.listScopedRules(request.params.siteId, "exceptions") as RuleException[];
+      if (exception) exceptions.push(parseScopedRule(exception, request.params.siteId, "preview", "exceptions") as RuleException);
+      return { before: evaluateRules(wafRequest, store.listRules()), after: evaluateRules(wafRequest, store.listRules(), exceptions) };
+    }
   );
 
   app.get("/api/v1/rules", async () => ({ data: store.listRules() }));

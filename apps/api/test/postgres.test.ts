@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { Pool } from "pg";
-import { BUILTIN_RULES } from "@jev-waf/core";
+import { BUILTIN_RULES, defaultPolicy } from "@jev-waf/core";
+import { migrate } from "../src/db/migrate.js";
 import { config } from "../src/config.js";
 import { checkPassword } from "../src/auth.js";
 import { Store } from "../src/db/store.js";
@@ -81,6 +82,15 @@ test("real PostgreSQL migration, restart, all-history metrics and failure atomic
   await assert.rejects(restarted.importRules([{ ...pack[0]!, id: "ATOMIC-FIRST" }, { ...pack[0]!, id: "FAIL-SECOND" }]));
   assert.equal((await db.query("SELECT id FROM rules WHERE id = 'ATOMIC-FIRST'")).rowCount, 0);
   assert.equal(restarted.listRules().some((rule) => rule.id === "ATOMIC-FIRST"), false);
+  const deletion = await restarted.saveSite({ name: "Atomic deletion", listenPort: 8085, mode: "traditional", enabled: false, upstreamUrl: "http://127.0.0.1:9105" });
+  await restarted.saveScopedRule(deletion.id, "access-rules", { name: "Temporary ACL", method: "*", path: "*", cidr: "127.0.0.0/8", action: "block", enabled: true, expiresAt: "2099-01-01T00:00:00Z" });
+  await db.query("ALTER TABLE sites RENAME TO sites_unavailable");
+  await assert.rejects(restarted.deleteSite(deletion.id));
+  assert.equal((await db.query("SELECT id FROM scoped_rules WHERE site_id=$1", [deletion.id])).rowCount, 1);
+  assert.ok(restarted.listSites().some((site) => site.id === deletion.id));
+  await db.query("ALTER TABLE sites_unavailable RENAME TO sites");
+  await restarted.deleteSite(deletion.id);
+  assert.equal((await db.query("SELECT id FROM scoped_rules WHERE site_id=$1", [deletion.id])).rowCount, 0);
   const options = await db.query("SELECT options FROM rules WHERE id = $1", [pack[0]!.id]);
   assert.deepEqual(options.rows[0].options.transforms, ["lowercase"]);
   const third = new Store();
@@ -97,6 +107,8 @@ test("real PostgreSQL migration, restart, all-history metrics and failure atomic
            NOW() - (n % 5) * INTERVAL '1 minute' + (n % 100) * INTERVAL '1 microsecond'
     FROM generate_series(1, 2300) n
   `);
+  await db.query("DROP TABLE event_totals");
+  await migrate();
   const summary = await restarted.summary();
   assert.equal(summary.total, 2300);
   assert.equal(summary.blocked, 2200);
@@ -122,6 +134,17 @@ test("real PostgreSQL migration, restart, all-history metrics and failure atomic
   await restarted.saveEvent(decision, { method: "GET", path: "/dedup" }, 200);
   await restarted.saveEvent(decision, { method: "GET", path: "/dedup" }, 200);
   assert.equal((await restarted.summary()).total, 2301);
+  const site = restarted.listSites()[0]!;
+  const policy = { ...defaultPolicy(), enforcement: "observe" as const, strength: "custom" as const, customThreshold: 0.37 };
+  await restarted.saveSite({ ...site, policy });
+  const exception = await restarted.saveScopedRule(site.id, "exceptions", { name: "Editor", method: "POST", path: "/editor", target: "body", selector: "template",
+    ruleIds: [BUILTIN_RULES[0]!.id], expiresAt: "2099-01-01T00:00:00Z", reason: "Verified template field", enabled: true });
+  const policyRestart = new Store(); stores.push(policyRestart); await policyRestart.init();
+  assert.equal(policyRestart.effectivePolicy(policyRestart.listSites()[0]!).customThreshold, 0.37);
+  assert.equal(policyRestart.listScopedRules(site.id, "exceptions")[0]!.id, exception.id);
+  assert.equal(await policyRestart.pruneEvents("2099-01-01T00:00:00Z"), 1000);
+  assert.equal((await policyRestart.summary()).total, 2301);
+  assert.equal((await policyRestart.listEvents({ limit: 500 })).data.length, 500);
   await restarted.updateSettings({ apiKey: null });
   assert.equal(config.openRouterKey, "environment-test-fallback");
   console.log(`Verified PostgreSQL schema: ${schema}`);

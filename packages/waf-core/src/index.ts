@@ -1,6 +1,10 @@
 import { isIpInCidr, isUnsafeUrl } from "./ip.js";
 import { compileSafeRegex } from "./regex.js";
 import { transformValue, variableValues } from "./rule-values.js";
+import { buildAiInspection, isJsonType, safeSnippet } from "./privacy.js";
+import type { SitePolicy, RuleException } from "./policy.js";
+export { defaultPolicy, type SitePolicy, type RuleException, type AccessRule } from "./policy.js";
+export { buildAiInspection, safeRequestPath, safeSnippet, isJsonType } from "./privacy.js";
 export { isIpInCidr } from "./ip.js";
 export { compileSafeRegex, MAX_PATTERN_LENGTH } from "./regex.js";
 export { RULE_TRANSFORMS } from "./rule-values.js";
@@ -24,6 +28,7 @@ export const STRENGTH_THRESHOLDS: Record<Exclude<ProtectionStrength, "custom">, 
 };
 
 export type WafRequest = {
+  siteId?: string;
   method: string;
   path: string;
   query: string;
@@ -63,6 +68,8 @@ export type RuleMatch = {
   severity: WafRule["severity"];
   action: RuleAction;
   target: RuleTarget;
+  field?: string;
+  snippet?: string;
 };
 
 export type AiDecision = {
@@ -71,6 +78,7 @@ export type AiDecision = {
   latencyMs: number;
   available: boolean;
   error?: string;
+  errorCode?: string;
 };
 
 export type WafDecision = {
@@ -83,6 +91,12 @@ export type WafDecision = {
   requestId: string;
   ai?: AiDecision;
   partialInspection?: boolean;
+  localInspectionComplete?: boolean;
+  aiInspectionComplete?: boolean;
+  aiOmittedReason?: string;
+  wouldBlock?: boolean;
+  exceptionIds?: string[];
+  module?: string;
 };
 
 export type EvaluationSettings = {
@@ -224,28 +238,80 @@ function matchesRule(value: string, rule: WafRule): boolean {
   }
 }
 
-export function evaluateRules(request: WafRequest, rules: WafRule[]): RuleMatch[] {
+function exceptionRequest(request: WafRequest, exceptions: RuleException[]): WafRequest {
+  if (!exceptions.length) return request;
+  const next = { ...request, headers: { ...request.headers } };
+  for (const exception of exceptions) {
+    if (exception.target === "header") delete next.headers[exception.selector.toLowerCase()];
+    if (exception.target === "query") {
+      const params = new URLSearchParams(next.query.replace(/^\?/, ""));
+      params.delete(exception.selector);
+      next.query = params.toString();
+    }
+    if (exception.target === "cookie") next.headers.cookie = (next.headers.cookie ?? "").split(";")
+      .filter((part) => part.split("=", 1)[0]?.trim() !== exception.selector).join(";");
+    if (exception.target === "body") {
+      const type = next.headers["content-type"] ?? "";
+      if (isJsonType(type)) {
+        try {
+          const body = JSON.parse(next.body ?? "") as unknown;
+          const segments = exception.selector.split(".");
+          let parent = body;
+          for (const segment of segments.slice(0, -1)) parent = parent && typeof parent === "object"
+            ? (parent as Record<string, unknown>)[segment] : undefined;
+          if (parent && typeof parent === "object") delete (parent as Record<string, unknown>)[segments.at(-1)!];
+          next.body = JSON.stringify(body);
+        } catch { /* Invalid structures are never exempted. */ }
+      } else if (/^application\/x-www-form-urlencoded\b/i.test(type)) {
+        const params = new URLSearchParams(next.body);
+        params.delete(exception.selector);
+        next.body = params.toString();
+      }
+    }
+  }
+  return next;
+}
+
+function ruleEvidence(request: WafRequest, rule: WafRule): Pick<RuleMatch, "field" | "snippet"> {
+  if (rule.target === "body" || rule.target === "query") {
+    const source = rule.target === "body" ? "body" : "query";
+    for (const name of variableValues(request, [{ target: "argNames", argumentSource: source }])) {
+      const value = variableValues(request, [{ target: "args", argumentSource: source, selector: name }])[0] ?? "";
+      if (matchesRule(normalizeSecurityText(decodeRepeated(value)), rule)) return { field: name, snippet: safeSnippet(value, name) };
+    }
+  }
+  if (rule.target === "header") for (const [name, value] of Object.entries(request.headers)) {
+    if (matchesRule(normalizeSecurityText(decodeRepeated(`${name}: ${value}`)), rule)) return { field: name, snippet: safeSnippet(value, name) };
+  }
+  return { field: rule.selector ?? "", snippet: "[OMITTED]" };
+}
+
+export function evaluateRules(request: WafRequest, rules: WafRule[], exceptions: RuleException[] = []): RuleMatch[] {
   const values = new Map<RuleTarget, string[]>();
   return rules
     .filter((rule) => {
       if (!rule.enabled) return false;
+      const scoped = exceptions.filter((exception) => exception.enabled && exception.siteId === request.siteId
+        && (exception.method === "*" || exception.method === request.method) && exception.path === request.path
+        && Date.parse(exception.expiresAt) > Date.now() && exception.ruleIds.includes(rule.id));
+      const inputRequest = exceptionRequest(request, scoped);
       if (rule.normalization === "modsecurity" || rule.selector || rule.variables
         || rule.target === "args" || rule.target.endsWith("Names") || rule.target === "method") {
         const variables = rule.variables ?? [{
           target: rule.target, ...(rule.selector ? { selector: rule.selector } : {}),
           ...(rule.argumentSource ? { argumentSource: rule.argumentSource } : {})
         }];
-        const inputs = variableValues(request, variables);
+        const inputs = variableValues(inputRequest, variables);
         return inputs.some((input) => {
           const value = rule.normalization === "modsecurity" ? input : normalizeSecurityText(decodeRepeated(input));
           const match = matchesRule(transformValue(value, rule.transforms ?? []), rule);
           return rule.negate ? !match : match;
         });
       }
-      let target = values.get(rule.target);
+      let target = scoped.length ? undefined : values.get(rule.target);
       if (!target) {
-        target = inspectionValues(request, rule.target);
-        values.set(rule.target, target);
+        target = inspectionValues(inputRequest, rule.target);
+        if (!scoped.length) values.set(rule.target, target);
       }
       return target.some((value) => {
         const match = matchesRule(transformValue(value, rule.transforms ?? []), rule);
@@ -258,7 +324,10 @@ export function evaluateRules(request: WafRequest, rules: WafRule[]): RuleMatch[
       category: rule.category,
       severity: rule.severity,
       action: rule.action,
-      target: rule.target
+      target: rule.target,
+      ...ruleEvidence(exceptionRequest(request, exceptions.filter((entry) => entry.enabled && entry.siteId === request.siteId
+        && (entry.method === "*" || entry.method === request.method) && entry.path === request.path
+        && Date.parse(entry.expiresAt) > Date.now() && entry.ruleIds.includes(rule.id))), rule)
     }));
 }
 
@@ -266,61 +335,8 @@ function hasBlockingMatch(matches: RuleMatch[]): boolean {
   return matches.some((match) => match.action === "block");
 }
 
-const sensitiveField = /auth|api.?key|pass(word|wd)?|pwd|secret|token|session|credential|cookie/i;
-function sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(headers)
-      .map(([key, value]) => [key, sensitiveField.test(key) ? "[REDACTED]" : value])
-  );
-}
-
-function sanitizeParams(raw: string): string {
-  const params = new URLSearchParams(decodeRepeated(raw.startsWith("?") ? raw.slice(1) : raw));
-  for (const key of params.keys()) {
-    if (sensitiveField.test(key)) params.set(key, "[REDACTED]");
-  }
-  return params.toString();
-}
-
-function sanitizeJson(value: unknown, depth = 0): unknown {
-  if (depth > 8) return "[OMITTED: nesting limit]";
-  if (Array.isArray(value)) return value.map((item) => sanitizeJson(item, depth + 1));
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, sensitiveField.test(key) ? "[REDACTED]" : sanitizeJson(item, depth + 1)])
-    );
-  }
-  return value;
-}
-
-function sanitizeBody(body: string, contentType: string): string {
-  if (!body) return "";
-  if (/^application\/json\b/i.test(contentType)) {
-    try {
-      return JSON.stringify(sanitizeJson(JSON.parse(body)));
-    } catch {
-      return "[OMITTED: invalid JSON]";
-    }
-  }
-  if (/^application\/x-www-form-urlencoded\b/i.test(contentType)) return sanitizeParams(body);
-  if (/^(application\/xml|text\/xml|text\/plain|multipart\/form-data)\b/i.test(contentType)) {
-    return normalizeSecurityText(body).slice(0, 32768);
-  }
-  return normalizeSecurityText(body).slice(0, 32768);
-}
-
 export function buildAiState(request: WafRequest, bodyLimit: number): string {
-  const safeHeaders = sanitizeHeaders(request.headers);
-  const body = sanitizeBody((request.body ?? "").slice(0, bodyLimit), request.headers["content-type"] ?? "");
-  return JSON.stringify({
-    method: request.method,
-    path: request.path,
-    query: sanitizeParams(request.query),
-    headers: safeHeaders,
-    body,
-    ip: request.ip,
-    websocketUpgrade: request.isWebSocketUpgrade ?? false
-  });
+  return buildAiInspection(request, bodyLimit).state;
 }
 
 export async function evaluateRequest(
@@ -328,70 +344,104 @@ export async function evaluateRequest(
   rules: WafRule[],
   settings: EvaluationSettings,
   requestId: string,
-  classify: (state: string, model: string, timeoutMs: number) => Promise<AiDecision>
+  classify: (state: string, model: string, timeoutMs: number) => Promise<AiDecision>,
+  context: { policy?: SitePolicy; exceptions?: RuleException[] } = {}
 ): Promise<WafDecision> {
-  const matches = settings.mode === "ai" ? [] : evaluateRules(request, rules);
+  const policy = context.policy;
+  const matches = settings.mode === "ai" ? [] : evaluateRules(request,
+    rules.filter((rule) => !policy?.disabledRuleIds.includes(rule.id)), context.exceptions);
+  const finish = (decision: WafDecision): WafDecision => {
+    const localInspectionComplete = decision.localInspectionComplete ?? settings.mode !== "ai";
+    const suppressed = localInspectionComplete && context.exceptions?.length
+      ? evaluateRules(request, rules.filter((rule) => !policy?.disabledRuleIds.includes(rule.id)))
+        .filter((match) => !decision.matchedRules.some((entry) => entry.ruleId === match.ruleId)).map((match) => match.ruleId) : [];
+    return { ...decision,
+    localInspectionComplete, module: decision.module ?? (decision.ai ? settings.mode === "hybrid" ? "rules+ai" : "ai" : "rules"),
+    exceptionIds: (context.exceptions ?? []).filter((entry) => entry.enabled && entry.siteId === request.siteId
+      && entry.path === request.path && (entry.method === "*" || entry.method === request.method)
+      && Date.parse(entry.expiresAt) > Date.now() && entry.ruleIds.some((id) => suppressed.includes(id))).map((entry) => entry.id),
+    ...(policy?.enforcement === "observe" && decision.action === "block"
+      ? { action: "allow", wouldBlock: true, reason: "观察模式：检测命中" } : {})
+    };
+  };
   if (hasBlockingMatch(matches)) {
-    return {
+    return finish({
       action: "block",
       mode: settings.mode,
       matchedRules: matches,
       reason: "传统规则命中",
       requestId
-    };
+    });
   }
 
   if (settings.mode === "traditional") {
-    return {
+    return finish({
       action: "allow",
       mode: settings.mode,
       matchedRules: matches,
       reason: matches.length > 0 ? "规则仅记录" : "未命中传统规则",
       requestId
-    };
+    });
   }
 
-  if (settings.mode === "ai" && Buffer.byteLength(request.body ?? "", "utf8") > settings.aiBodyLimit) {
+  if (!policy && settings.mode === "ai" && Buffer.byteLength(request.body ?? "", "utf8") > settings.aiBodyLimit) {
     return {
       action: "error", mode: settings.mode, matchedRules: matches, requestId,
-      reason: "请求体超过 AI 完整检测上限", partialInspection: true
+      reason: "请求体超过 AI 完整检测上限", partialInspection: true,
+      localInspectionComplete: false, aiInspectionComplete: false, aiOmittedReason: "body_limit", module: "ai"
     };
   }
 
-  const ai = await classify(buildAiState(request, settings.aiBodyLimit), settings.model, settings.aiTimeoutMs);
+  if (policy?.aiScope === "suspicious" && settings.mode === "hybrid" && !matches.length) {
+    return finish({ action: "allow", mode: settings.mode, matchedRules: matches, reason: "传统规则通过，无需 AI 复核", requestId });
+  }
+  const inspection = buildAiInspection(request, settings.aiBodyLimit, policy?.aiBodyFields);
+  const coverage = { aiInspectionComplete: inspection.complete, partialInspection: !inspection.complete,
+    ...(inspection.omittedReason ? { aiOmittedReason: inspection.omittedReason } : {}) };
+  if (!inspection.complete && (policy?.aiIncompleteAction === "block" || settings.mode === "ai" && policy?.aiIncompleteAction !== "local")) {
+    return finish({ action: "error", mode: settings.mode, matchedRules: matches, requestId,
+      reason: "AI 正文未完整检测", ...coverage });
+  }
+  if (!inspection.complete && policy?.aiIncompleteAction === "local") {
+    const localMatches = settings.mode === "ai" ? evaluateRules(request,
+      rules.filter((rule) => !policy.disabledRuleIds.includes(rule.id)), context.exceptions) : matches;
+    return finish({ action: hasBlockingMatch(localMatches) ? "block" : "allow", mode: settings.mode,
+      matchedRules: localMatches, requestId, reason: "AI 检查不完整，继续本地结果", localInspectionComplete: true, module: "rules", ...coverage });
+  }
+  const ai = await classify(inspection.state, settings.model, settings.aiTimeoutMs);
   if (!ai.available) {
-    if (settings.mode === "ai") {
-      return {
+    if (policy?.aiFailureAction === "block" || settings.mode === "ai" && policy?.aiFailureAction !== "allow") {
+      return finish({
         action: "error",
         mode: settings.mode,
         matchedRules: matches,
         reason: "Jev 不可用，AI 模式已阻断",
         requestId,
-        ai
-      };
+        ai, ...coverage
+      });
     }
-    return {
+    return finish({
       action: "allow",
       mode: settings.mode,
       matchedRules: matches,
       reason: "Jev 不可用，混合模式按传统规则降级放行",
       requestId,
-      ai
-    };
+      ai, ...coverage
+    });
   }
 
   const threshold = thresholdFor(settings);
   const action = ai.noul >= threshold ? "block" : "allow";
-  return {
+  return finish({
     action,
     mode: settings.mode,
     score: ai.noul,
     threshold,
     matchedRules: matches,
-    reason: action === "block" ? "Jev 概率达到拦截阈值" : "Jev 概率低于拦截阈值",
+    reason: action === "block" ? "Jev 风险分数达到拦截阈值" : "Jev 风险分数低于拦截阈值",
     requestId,
-    ai
-  };
+    ai, ...coverage
+  });
 }
 
 const legacyRules: WafRule[] = [

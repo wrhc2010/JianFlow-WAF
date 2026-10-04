@@ -2,7 +2,7 @@ import http from "node:http";
 import type { Socket } from "node:net";
 import { once } from "node:events";
 import { config } from "./config.js";
-import { createProxyServer } from "./proxy.js";
+import { createProxyServer, createHttpsProxyServer } from "./proxy.js";
 import { Store } from "./db/store.js";
 
 export class ProxyListenerManager {
@@ -27,28 +27,47 @@ export class ProxyListenerManager {
   }
 
   private async apply(): Promise<void> {
-    const desired = new Set(
-      this.store.listSites()
-        .filter((site) => site.enabled)
-        .map((site) => site.listenPort)
-    );
+    const desired = new Set<number>();
+    for (const site of this.store.listSites()) {
+      const revision = site.revision ?? 1;
+      if (!site.enabled) {
+        this.store.reportRuntime?.(site.id, { state: "disabled", desiredRevision: revision, appliedRevision: revision });
+        continue;
+      }
+      const ports = [{ port: site.listenPort, tls: false }];
+      if (site.id === "default" && (config.tlsKeyPath || config.tlsCertPath)) ports.push({ port: config.httpsPort, tls: true });
+      let lastError = "";
+      for (const binding of ports) {
+        desired.add(binding.port);
+        if (this.listeners.has(binding.port)) continue;
+        const server = binding.tls
+          ? createHttpsProxyServer(this.store, config.tlsKeyPath, config.tlsCertPath, site.listenPort)
+          : createProxyServer(this.store, site.listenPort);
+        if (!server) { lastError = "TLS certificate could not be loaded"; continue; }
+        const connections = new Set<Socket>();
+        this.connections.set(server, connections);
+        server.on("connection", (socket) => {
+          connections.add(socket);
+          socket.once("close", () => connections.delete(socket));
+        });
+        try {
+          const listening = once(server, "listening");
+          server.listen(binding.port, config.proxyHost);
+          await listening;
+          this.listeners.set(binding.port, server);
+        } catch (error) {
+          lastError = `${binding.tls ? "HTTPS" : "HTTP"} :${binding.port} ${(error as NodeJS.ErrnoException).code ?? "listen_failed"}`;
+          await this.closeListener(server);
+        }
+      }
+      this.store.reportRuntime?.(site.id, { state: lastError ? "error" : "active", desiredRevision: revision,
+        appliedRevision: lastError ? site.runtime?.appliedRevision ?? 0 : revision, ...(lastError ? { lastError } : {}) });
+    }
+    // Prepare additions first, so an occupied new port does not disturb other entries.
     for (const [port, server] of this.listeners) {
       if (desired.has(port)) continue;
       await this.closeListener(server);
       this.listeners.delete(port);
-    }
-    for (const port of desired) {
-      if (this.listeners.has(port)) continue;
-      const server = createProxyServer(this.store, port);
-      const connections = new Set<Socket>();
-      this.connections.set(server, connections);
-      server.on("connection", (socket) => {
-        connections.add(socket);
-        socket.once("close", () => connections.delete(socket));
-      });
-      server.listen(port, config.proxyHost);
-      await once(server, "listening");
-      this.listeners.set(port, server);
     }
   }
 

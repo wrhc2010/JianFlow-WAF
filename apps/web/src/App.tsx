@@ -3,6 +3,7 @@ import { geoGraticule10, geoNaturalEarth1, geoPath } from "d3-geo";
 import { feature } from "topojson-client";
 import worldAtlas from "world-atlas/countries-110m.json";
 import type { GeometryCollection, Topology } from "topojson-specification";
+import { PolicyFields, ScopedRules, initialPolicy, type SitePolicy, type ExceptionSeed } from "./PolicyControls";
 import {
   Activity,
   AlertTriangle,
@@ -51,6 +52,7 @@ type Settings = {
   upstreamUrl: string;
   apiKeyConfigured: boolean;
   apiKeySource: "environment" | "database" | "none";
+  defaultPolicy: SitePolicy;
 };
 
 type Site = {
@@ -61,9 +63,12 @@ type Site = {
   mode: Mode;
   enabled: boolean;
   createdAt: string;
+  policy?: SitePolicy | null;
+  revision?: number;
+  runtime?: { state: "pending" | "active" | "disabled" | "error"; desiredRevision: number; appliedRevision: number; lastError?: string };
 };
 
-type SiteDraft = Pick<Site, "name" | "listenPort" | "upstreamUrl" | "mode" | "enabled">;
+type SiteDraft = Pick<Site, "name" | "listenPort" | "upstreamUrl" | "mode" | "enabled" | "policy">;
 
 type Rule = {
   id: string;
@@ -92,7 +97,7 @@ type EventRecord = {
   score?: number;
   threshold?: number;
   reason: string;
-  matchedRules: Array<{ ruleId: string; name: string; category: string; severity: string }>;
+  matchedRules: Array<{ ruleId: string; name: string; category: string; severity: string; target?: string; field?: string; snippet?: string }>;
   ai?: { model: string; noul: number; latencyMs: number; available: boolean; error?: string };
   partialInspection: boolean;
   country?: string;
@@ -102,6 +107,15 @@ type EventRecord = {
   longitude?: number;
   asn?: number;
   createdAt: string;
+  siteId?: string;
+  listenPort?: number;
+  policyRevision?: number;
+  module?: string;
+  localInspectionComplete?: boolean;
+  aiInspectionComplete?: boolean;
+  aiOmittedReason?: string;
+  wouldBlock?: boolean;
+  exceptionIds?: string[];
 };
 
 type MapData = {
@@ -125,7 +139,12 @@ type SystemStatus = {
   sitePortRange: { min: number; max: number };
   maxRequestBodyBytes: number;
   httpsEnabled: boolean;
+  httpsConfigured?: boolean;
+  httpsPort?: number;
   geoIpAsnConfigured: boolean;
+  ready?: boolean;
+  aiRuntime?: { active: number; calls: number; limit: number; circuitOpen: boolean };
+  events?: { queueDepth: number; queueLimit: number; droppedEvents: number; writeErrors: number; retentionDays: number };
 };
 
 type CountryProperties = { name?: string };
@@ -146,7 +165,7 @@ const defaultSettings: Settings = {
   aiBodyLimit: 32768,
   upstreamUrl: "http://127.0.0.1:9000",
   apiKeyConfigured: false,
-  apiKeySource: "none"
+  apiKeySource: "none", defaultPolicy: initialPolicy
 };
 
 const defaultSystem: SystemStatus = {
@@ -324,12 +343,24 @@ function Console({ onLogout }: { onLogout: () => void }) {
   const [collapsed, setCollapsed] = useState(false);
   const [section, setSection] = useState("overview");
   const [dirtySections, setDirtySections] = useState<Record<string, boolean>>({});
+  const [runtime, setRuntime] = useState<{ ready: boolean; apiPort: number; active: number } | null>(null);
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem("jianflow-theme") as Theme | null) ?? "dark");
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("jianflow-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    const refresh = async () => {
+      try {
+        const [system, result] = await Promise.all([api<SystemStatus & { ready: boolean }>("/api/v1/system"), api<{ data: Site[] }>("/api/v1/sites")]);
+        setRuntime({ ready: system.ready, apiPort: system.apiPort, active: result.data.filter((site) => site.runtime?.state === "active").length });
+      } catch { setRuntime(null); }
+    };
+    void refresh(); const timer = window.setInterval(() => void refresh(), 10000);
+    return () => window.clearInterval(timer);
+  }, [section]);
 
   const nav = [
     { id: "overview", label: "总览", icon: CircleGauge },
@@ -361,7 +392,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
           })}
         </nav>
         <div className="sidebar-bottom">
-          {!collapsed && <div className="node-card"><div className="node-card-head"><span className="node-status"><span className="status-dot" />运行中</span><span>单节点</span></div><strong>jianflow-local</strong><span>HTTP :8080 / API :4000</span></div>}
+          {!collapsed && <div className="node-card"><div className="node-card-head"><span className="node-status"><span className={`status-dot ${runtime?.ready ? "" : "amber"}`} />{runtime ? runtime.ready ? "入口已同步" : "入口待恢复" : "状态不可用"}</span><span>单节点</span></div><strong>{runtime ? `${runtime.active} 个运行入口` : "JianFlow WAF"}</strong><span>{runtime ? `API :${runtime.apiPort}` : "管理连接待恢复"}</span></div>}
           <button className="nav-item" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} title={theme === "dark" ? "切换浅色模式" : "切换深色模式"}>{theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}{!collapsed && <span>{theme === "dark" ? "浅色模式" : "深色模式"}</span>}</button>
           <button className="nav-item" onClick={onLogout} title="退出登录"><LogOut size={17} />{!collapsed && <span>退出登录</span>}</button>
         </div>
@@ -370,7 +401,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
         <header className="topbar">
           <button className="icon-button" onClick={() => setCollapsed(!collapsed)} aria-label="折叠导航"><PanelLeft size={17} /></button>
           <div className="breadcrumb"><span>JianFlow WAF</span><ArrowRight size={13} /><strong>{navLabel(section)}</strong></div>
-          <div className="topbar-right"><span className="live-pill"><span className="status-dot" />防护已启用</span><span className="topbar-time">{new Date().toLocaleDateString("zh-CN")}</span></div>
+          <div className="topbar-right"><span className="live-pill"><span className={`status-dot ${runtime?.ready ? "" : "amber"}`} />{runtime ? `${runtime.active} 个运行入口` : "状态不可用"}</span><span className="topbar-time">{new Date().toLocaleDateString("zh-CN")}</span></div>
         </header>
         <div className="content">
           {section === "overview" && <Overview onSection={setSection} />}
@@ -677,6 +708,8 @@ function AttackerList({ attackers, loading }: { attackers: MapData["attackers"];
 }
 
 function Events() {
+  const [sites, setSites] = useState<Site[]>([]);
+  const [siteId, setSiteId] = useState("");
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -696,6 +729,7 @@ function Events() {
       if (search.trim()) params.set("search", search.trim());
       if (since) params.set("since", new Date(since).toISOString());
       if (until) params.set("until", new Date(until).toISOString());
+      if (siteId) params.set("siteId", siteId);
       const result = await api<{ data: EventRecord[]; nextCursor?: string }>(`/api/v1/events?${params}`);
       setEvents((current) => append ? [...current, ...result.data] : result.data);
       setNextCursor(result.nextCursor);
@@ -705,11 +739,13 @@ function Events() {
       setLoading(false);
     }
   };
-  useEffect(() => { void refresh(); }, [filter, search, since, until]);
+  useEffect(() => { void api<{ data: Site[] }>("/api/v1/sites").then((result) => setSites(result.data)).catch(() => {}); }, []);
+  useEffect(() => { void refresh(); }, [filter, search, since, until, siteId]);
   return (
     <section>
-      <PageHeading eyebrow="请求事件" title="事件中心" description="每个请求的规则命中、AI 概率、来源和最终动作都可追溯。" action={<button className="secondary-button" onClick={() => void refresh()}><RefreshCw size={15} />刷新</button>} />
+      <PageHeading eyebrow="请求事件" title="事件中心" description="规则命中、AI 风险分数、来源与最终动作。" action={<button className="secondary-button" onClick={() => void refresh()}><RefreshCw size={15} />刷新</button>} />
       {error && <ErrorNotice message={error} onRetry={() => void refresh()} />}
+      <label className="field-label event-site-filter">站点<select value={siteId} onChange={(event) => setSiteId(event.target.value)}><option value="">所有站点</option><option value="unknown">旧事件 / 未知入口</option>{sites.map((site) => <option value={site.id} key={site.id}>{site.name} · :{site.listenPort}</option>)}</select></label>
       <div className="toolbar event-filters"><div className="search-box"><Search size={16} /><input placeholder="搜索路径、request ID 或 IP" value={search} onChange={(event) => setSearch(event.target.value)} /></div><div className="segmented">{["all", "block", "allow", "error"].map((value) => <button key={value} className={filter === value ? "selected" : ""} onClick={() => setFilter(value)}>{value === "all" ? "全部" : value === "block" ? "已拦截" : value === "allow" ? "已放行" : "错误"}</button>)}</div><label className="date-filter">开始<input type="datetime-local" value={since} onChange={(event) => setSince(event.target.value)} /></label><label className="date-filter">结束<input type="datetime-local" value={until} onChange={(event) => setUntil(event.target.value)} /></label><button className="icon-button" title="清除筛选" onClick={() => { setSearch(""); setFilter("all"); setSince(""); setUntil(""); }}><X size={16} /></button></div>
       <Panel title={`${events.length} 条已加载事件`} action={<span className="panel-meta">服务端游标分页 · 统计为全量</span>}>
         {loading && !events.length ? <LoadingRows count={7} /> : <EventTable events={events} onSelect={setSelected} />}
@@ -763,6 +799,7 @@ function Rules() {
 }
 
 function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
+  const [scopedDirty, setScopedDirty] = useState(false);
   const [sites, setSites] = useState<Site[]>([]);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [system, setSystem] = useState<SystemStatus>(defaultSystem);
@@ -772,19 +809,21 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(true);
+  const [rules, setRules] = useState<Rule[]>([]);
 
   const load = async () => {
     setLoading(true);
     setError("");
     try {
-      const [siteResult, nextSettings, nextSystem] = await Promise.all([
+      const [siteResult, nextSettings, nextSystem, ruleResult] = await Promise.all([
         api<{ data: Site[] }>("/api/v1/sites"),
         api<Settings>("/api/v1/settings"),
-        api<SystemStatus>("/api/v1/system")
+        api<SystemStatus>("/api/v1/system"), api<{ data: Rule[] }>("/api/v1/rules")
       ]);
       setSites(siteResult.data);
       setSettings(nextSettings);
       setSystem(nextSystem);
+      setRules(ruleResult.data);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "站点加载失败");
     } finally {
@@ -793,7 +832,7 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
   };
 
   useEffect(() => { void load(); }, []);
-  const formDirty = Boolean(form && originalForm && JSON.stringify(form) !== JSON.stringify(originalForm));
+  const formDirty = scopedDirty || Boolean(form && originalForm && JSON.stringify(form) !== JSON.stringify(originalForm));
   useEffect(() => {
     onDirtyChange(formDirty);
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -820,7 +859,7 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
       listenPort: port,
       upstreamUrl: settings.upstreamUrl,
       mode: settings.apiKeyConfigured ? settings.mode : "traditional",
-      enabled: true
+      enabled: true, policy: null
     };
     setEditingId(null);
     setForm(next);
@@ -834,7 +873,7 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
       listenPort: site.listenPort,
       upstreamUrl: site.upstreamUrl,
       mode: settings.apiKeyConfigured ? site.mode : "traditional",
-      enabled: site.enabled
+      enabled: site.enabled, policy: site.policy ?? null
     };
     setEditingId(site.id);
     setForm(next);
@@ -910,13 +949,16 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
                 <span className="site-card-kicker">{site.id === "default" ? "默认入口" : "站点"}</span>
                 <h2>{site.name}</h2>
               </div>
-              <span className={`status-badge ${site.enabled ? "green" : "amber"}`}>{site.enabled ? "运行中" : "已停用"}</span>
+              <span className={`status-badge ${site.runtime?.state === "active" ? "green" : site.runtime?.state === "error" ? "red" : "amber"}`}>{site.runtime?.state === "active" ? "运行中" : site.runtime?.state === "error" ? "应用失败" : site.enabled ? "待应用" : "已停用"}</span>
             </div>
             <div className="site-card-data">
               <div><span>入口端口</span><strong>:{site.listenPort}</strong></div>
               <div><span>上游地址</span><strong title={site.upstreamUrl}>{site.upstreamUrl}</strong></div>
               <div><span>防护模式</span><strong>{modeLabel(site.mode)}</strong></div>
+              <div><span>策略</span><strong>{site.policy ? "本站覆盖" : "继承全局"} · {(site.policy ?? settings.defaultPolicy).enforcement === "observe" ? "观察" : "阻断"}</strong></div>
+              <div><span>配置版本</span><strong>{site.runtime?.appliedRevision ?? 0} / {site.revision ?? 1}</strong></div>
             </div>
+            {site.runtime?.lastError && <div className="runtime-error">{site.runtime.lastError}<button className="icon-button" title="重试应用" aria-label="重试应用" onClick={async () => { await api("/api/v1/listener-reloads", { method: "POST", body: "{}" }); void load(); }}><RefreshCw size={14} /></button></div>}
             <div className="site-card-actions">
               <button className="icon-button" title="编辑站点" aria-label="编辑站点" onClick={() => openEdit(site)}><Edit3 size={15} /></button>
               <button className="icon-button" title={site.enabled ? "停用站点" : "启用站点"} aria-label={site.enabled ? "停用站点" : "启用站点"} onClick={() => void toggle(site)}><Power size={15} /></button>
@@ -927,18 +969,23 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
       </div>}
       <div className="two-column sites-footer">
         <Panel title="数据面状态">
-          <StatusLine icon={Server} label="HTTP 监听" value={`:${system.sitePortRange.min}-${system.sitePortRange.max}`} state="good" />
-          <StatusLine icon={Network} label="启用入口" value={`${sites.filter((site) => site.enabled).length} 个站点`} state="good" />
-          <StatusLine icon={Globe2} label="HTTPS 终止" value={system.httpsEnabled ? `:${system.proxyPort === 8080 ? 8443 : "已配置"}` : "待配置证书"} state={system.httpsEnabled ? "good" : "warn"} />
+          <StatusLine icon={Server} label="配置端口范围" value={`:${system.sitePortRange.min}-${system.sitePortRange.max}`} state="good" />
+          <StatusLine icon={Network} label="实际运行入口" value={`${sites.filter((site) => site.runtime?.state === "active").length} / ${sites.filter((site) => site.enabled).length} 个站点`} state={system.ready ? "good" : "warn"} />
+          <StatusLine icon={Globe2} label="HTTPS 终止" value={system.httpsEnabled ? `:${system.httpsPort}` : system.httpsConfigured ? "未运行" : "未配置证书"} state={system.httpsEnabled ? "good" : "warn"} />
         </Panel>
-        <Panel title="部署提示">
-          <div className="note-box"><span className="note-title">Linux / Docker</span><p>端口范围由 SITE_PORT_RANGE 控制。修改范围后要同步 Compose 端口映射并重启；上游地址可以填写 Compose 网络内的服务名。</p></div>
+        <Panel title="资源状态">
+          <StatusLine icon={Bot} label="AI 并发 / 分钟调用" value={`${system.aiRuntime?.active ?? 0} / ${system.aiRuntime?.calls ?? 0}`} state={system.aiRuntime?.circuitOpen ? "warn" : "good"} />
+          <StatusLine icon={Activity} label="事件待写 / 丢弃" value={`${system.events?.queueDepth ?? 0} / ${system.events?.droppedEvents ?? 0}`} state={system.events?.droppedEvents ? "warn" : "good"} />
+          <StatusLine icon={AlertTriangle} label="事件写入错误" value={String(system.events?.writeErrors ?? 0)} state={system.events?.writeErrors ? "warn" : "good"} />
         </Panel>
       </div>
       {form && <SiteEditor
         form={form}
         editingId={editingId}
         hasJevKey={settings.apiKeyConfigured}
+        globalPolicy={settings.defaultPolicy}
+        rules={rules}
+        onScopedDirtyChange={setScopedDirty}
         ports={editingId === "default" ? [system.proxyPort] : availablePorts(form.listenPort)}
         onChange={(patch) => setForm((current) => current ? { ...current, ...patch } : current)}
         onSave={() => void save()}
@@ -958,25 +1005,52 @@ function SiteEditor(props: {
   onSave: () => void;
   onCancel: () => void;
   status: string;
+  globalPolicy: SitePolicy;
+  rules: Rule[];
+  onScopedDirtyChange: (dirty: boolean) => void;
 }) {
+  const [tab, setTab] = useState("入口");
+  const [scopedDrafts, setScopedDrafts] = useState({ exceptions: false, access: false });
+  const exceptionsDirty = useCallback((dirty: boolean) => setScopedDrafts((current) => current.exceptions === dirty ? current : { ...current, exceptions: dirty }), []);
+  const accessDirty = useCallback((dirty: boolean) => setScopedDrafts((current) => current.access === dirty ? current : { ...current, access: dirty }), []);
+  useEffect(() => { props.onScopedDirtyChange(scopedDrafts.exceptions || scopedDrafts.access); }, [scopedDrafts, props.onScopedDirtyChange]);
+  const switchTab = (next: string) => {
+    if (next === tab) return;
+    if ((scopedDrafts.exceptions || scopedDrafts.access) && !window.confirm("有未保存配置，确定切换吗？")) return;
+    setTab(next);
+  };
+  const [siteEvents, setSiteEvents] = useState<EventRecord[]>([]);
+  const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null);
+  useEffect(() => {
+    if (tab === "事件" && props.editingId) void api<{ data: EventRecord[] }>(`/api/v1/events?siteId=${props.editingId}&limit=50`).then((result) => setSiteEvents(result.data));
+  }, [tab, props.editingId]);
   return <div className="modal-backdrop site-editor-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) props.onCancel(); }}>
     <section className="site-editor" role="dialog" aria-modal="true" aria-label={props.editingId ? "编辑站点" : "新建站点"}>
       <div className="drawer-head"><div><p className="eyebrow">站点配置</p><h2>{props.editingId ? "编辑站点" : "新建站点"}</h2></div><button className="icon-button" title="关闭" aria-label="关闭" onClick={props.onCancel}><X size={16} /></button></div>
+      <div className="site-tabs" role="tablist">{["入口", "防护", "限速", "例外", "事件"].map((value) => <button type="button" role="tab" aria-selected={tab === value} disabled={!props.editingId && ["例外", "事件"].includes(value)} className={tab === value ? "selected" : ""} key={value} onClick={() => switchTab(value)}>{value}</button>)}</div>
       <div className="site-editor-body">
+        {tab === "入口" && <>
         <label className="field-label">站点名称<input value={props.form.name} onChange={(event) => props.onChange({ name: event.target.value })} autoFocus /></label>
         <label className="field-label">入口端口<select value={props.form.listenPort} onChange={(event) => props.onChange({ listenPort: Number(event.target.value) })}>{props.ports.map((port) => <option key={port} value={port}>:{port}</option>)}</select></label>
         <label className="field-label">上游地址<input value={props.form.upstreamUrl} onChange={(event) => props.onChange({ upstreamUrl: event.target.value })} placeholder="http://app:9000" /></label>
         <label className="field-label">防护模式<select value={props.form.mode} onChange={(event) => props.onChange({ mode: event.target.value as Mode })}><option value="traditional">传统规则</option><option value="hybrid" disabled={!props.hasJevKey}>混合模式{!props.hasJevKey ? "（需配置 Jev key）" : ""}</option><option value="ai" disabled={!props.hasJevKey}>AI 判断{!props.hasJevKey ? "（需配置 Jev key）" : ""}</option></select></label>
         <label className="check-label site-enabled"><input type="checkbox" checked={props.form.enabled} onChange={(event) => props.onChange({ enabled: event.target.checked })} />启用此入口</label>
         {!props.hasJevKey && <div className="inline-status">未配置 Jev key，AI 和混合模式不可用，保存时会使用传统规则。</div>}
+        </>}
+        {["防护", "限速"].includes(tab) && <><label className="check-label"><input type="checkbox" checked={!props.form.policy} onChange={(event) => props.onChange({ policy: event.target.checked ? null : structuredClone(props.globalPolicy) })} />继承全局默认策略</label>
+          <PolicyFields policy={props.form.policy ?? props.globalPolicy} disabled={!props.form.policy} rateOnly={tab === "限速"} rules={props.rules} onChange={(policy) => props.onChange({ policy })} /></>}
+        {tab === "例外" && props.editingId && <><ScopedRules api={api} siteId={props.editingId} kind="exceptions" rules={props.rules} onDirtyChange={exceptionsDirty} /><div className="divider" /><ScopedRules api={api} siteId={props.editingId} kind="access-rules" rules={props.rules} onDirtyChange={accessDirty} /></>}
+        {tab === "事件" && <EventTable events={siteEvents} onSelect={setSelectedEvent} />}
       </div>
       {props.status && <div className="form-error"><AlertTriangle size={15} />{props.status}</div>}
-      <div className="site-editor-actions"><button className="secondary-button" onClick={props.onCancel}>取消</button><button className="primary-button" onClick={props.onSave}><Save size={15} />保存站点</button></div>
+      <div className="site-editor-actions"><button className="secondary-button" onClick={props.onCancel}>取消</button>{!["例外", "事件"].includes(tab) && <button className="primary-button" onClick={props.onSave}><Save size={15} />保存站点</button>}</div>
+      {selectedEvent && <EventDetails event={selectedEvent} onClose={() => setSelectedEvent(null)} />}
     </section>
   </div>;
 }
 
 function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
+  const [rules, setRules] = useState<Rule[]>([]);
   const [serverSettings, setServerSettings] = useState<Settings | null>(null);
   const [draft, setDraft] = useState<Settings>(defaultSettings);
   const [apiKey, setApiKey] = useState("");
@@ -989,7 +1063,8 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
     setLoading(true);
     setError("");
     try {
-      const next = await api<Settings>("/api/v1/settings");
+      const [next, ruleResult] = await Promise.all([api<Settings>("/api/v1/settings"), api<{ data: Rule[] }>("/api/v1/rules")]);
+      setRules(ruleResult.data);
       setServerSettings(next);
       setDraft(next);
       setApiKey("");
@@ -1024,7 +1099,10 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
       setDraft((current) => current.mode === "traditional" ? current : { ...current, mode: "traditional" });
     }
   }, [hasJevKey]);
-  const updateDraft = (patch: Partial<Settings>) => setDraft((current) => ({ ...current, ...patch }));
+  const updateDraft = (patch: Partial<Settings>) => setDraft((current) => ({ ...current, ...patch,
+    defaultPolicy: patch.defaultPolicy ?? { ...current.defaultPolicy,
+      strength: patch.strength ?? current.strength, customThreshold: patch.customThreshold ?? current.customThreshold }
+  }));
   const cancel = () => {
     if (serverSettings) setDraft(serverSettings);
     setApiKey("");
@@ -1050,23 +1128,23 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
   };
   const modeOptions: Array<[Mode, string, string, typeof Network]> = [
     ["hybrid", "混合模式", "先规则过滤，再由 Jev 复核", Network],
-    ["ai", "AI 判断", "由 Jev 判断请求恶意概率", Bot],
+    ["ai", "AI 判断", "由 Jev 判断请求风险分数", Bot],
     ["traditional", "传统规则", "仅使用本地规则引擎", FileCode2]
   ];
   const strengthOptions: Array<[Strength, string, string, string]> = [
-    ["veryLow", "极低", "概率 ≥ 10%", "仅拦截高风险特征"],
-    ["low", "低", "概率 ≥ 30%", "积极拦截"],
-    ["medium", "中", "概率 ≥ 50%", "推荐默认"],
-    ["high", "高", "概率 ≥ 70%", "减少误报"],
-    ["extreme", "极高", "概率 ≥ 90%", "只拦截高置信度"],
-    ["custom", "自定义", `概率 ≥ ${Math.round(draft.customThreshold * 100)}%`, "手动设置"]
+    ["veryLow", "10%", "分数 ≥ 10%", "较低阈值，拦截范围更广"],
+    ["low", "30%", "分数 ≥ 30%", "较低阈值"],
+    ["medium", "50%", "分数 ≥ 50%", "默认阈值"],
+    ["high", "70%", "分数 ≥ 70%", "较高阈值"],
+    ["extreme", "90%", "分数 ≥ 90%", "较高阈值，拦截范围更窄"],
+    ["custom", "自定义", `分数 ≥ ${Math.round(draft.customThreshold * 100)}%`, "手动设置"]
   ];
   return (
     <section>
       <PageHeading
         eyebrow="防护策略"
         title="防护策略"
-        description="调整全局检测强度、Jev 参数和故障降级策略。"
+        description="全局默认策略与 Jev 配置。"
         action={<div className="panel-actions"><span className={`draft-state ${dirty ? "dirty" : ""}`}>{dirty ? "有未保存修改" : "已同步"}</span><button className="secondary-button" disabled={!dirty || loading} onClick={cancel}>取消更改</button><button className="primary-button" disabled={!dirty || loading} onClick={() => void save()}><Save size={15} />保存策略</button></div>}
       />
       {error && <ErrorNotice message={error} onRetry={() => void load()} />}
@@ -1088,12 +1166,13 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
           <div className="settings-actions"><button className="secondary-button" disabled={dirty} onClick={async () => { try { const result = await api<{ available: boolean; error?: string; latencyMs: number }>("/api/v1/settings/test-jev", { method: "POST", body: "{}" }); setJevStatus(result.available ? `Jev 连通成功 · ${result.latencyMs}ms` : `Jev 不可用 · ${result.error ?? "未知错误"}`); } catch (failure) { setJevStatus(failure instanceof Error ? failure.message : "Jev 测试失败"); } }}><Activity size={15} />测试 Jev 连接</button>{draft.apiKeySource === "database" && <button className="text-button" onClick={() => { setClearApiKey(true); setApiKey(""); setJevStatus("已标记移除 WebUI key，点击保存后生效"); }}><X size={14} />移除 WebUI key</button>}</div>
           {jevStatus && <div className="inline-status">{jevStatus}</div>}
         </Panel>
-        <Panel title="防护强度">
+        <Panel title="AI 拦截阈值">
           <div className="strength-list">{strengthOptions.map(([value, label, threshold, note]) => <button key={value} type="button" className={`strength-row ${draft.strength === value ? "selected" : ""}`} onClick={() => updateDraft({ strength: value })}><span className="radio">{draft.strength === value && <span />}</span><span className="strength-copy"><strong>{label}</strong><small>{note}</small></span><span className="strength-threshold">{threshold}</span></button>)}</div>
           {draft.strength === "custom" && <label className="field-label custom-field">自定义阈值<input type="range" min="0" max="100" value={Math.round(draft.customThreshold * 100)} onChange={(event) => updateDraft({ customThreshold: Number(event.target.value) / 100 })} /><strong>{Math.round(draft.customThreshold * 100)}%</strong></label>}
-          <div className="note-box"><span className="note-title">故障策略</span><p>AI 模式在 Jev 不可用时产生错误事件并阻断；混合模式在传统规则通过后按传统结果降级放行，同时记录 AI 不可用。</p></div>
+          <div className="note-box"><span className="note-title">当前 AI 故障策略</span><p>{draft.defaultPolicy.aiFailureAction === "block" ? "拒绝请求" : draft.defaultPolicy.aiFailureAction === "allow" ? "继续本地结果" : "按模式降级：AI 拒绝，混合继续本地结果"}</p></div>
         </Panel>
       </div>
+      <div className="two-column settings-layout global-policy-layout"><Panel title="全局默认防护"><PolicyFields policy={draft.defaultPolicy} rules={rules} onChange={(policy) => updateDraft({ defaultPolicy: policy, strength: policy.strength, customThreshold: policy.customThreshold })} /></Panel><Panel title="全局默认限速"><PolicyFields policy={draft.defaultPolicy} rateOnly onChange={(policy) => updateDraft({ defaultPolicy: policy })} /></Panel></div>
     </section>
   );
 }
@@ -1129,15 +1208,23 @@ function EventList({ events }: { events: EventRecord[] }) {
 
 function EventTable({ events, onSelect }: { events: EventRecord[]; onSelect: (event: EventRecord) => void }) {
   if (!events.length) return <div className="empty-state"><Activity size={22} /><span>没有符合筛选条件的事件</span></div>;
-  return <div className="table-wrap"><table><thead><tr><th>动作</th><th>请求</th><th>来源</th><th>模式</th><th>Jev 概率</th><th>规则命中</th><th>时间</th></tr></thead><tbody>{events.map((event) => <tr key={event.id} onClick={() => onSelect(event)}><td><span className={`status-badge ${event.action === "allow" ? "green" : event.action === "block" ? "red" : "amber"}`}>{event.action === "allow" ? "放行" : event.action === "block" ? "拦截" : "错误"}</span></td><td><strong>{event.method} {event.path}</strong><small>{event.requestId.slice(0, 12)}</small></td><td><strong>{event.ip ?? "unknown"}</strong><small>{event.country ?? "未知地区"}{event.region ? ` · ${event.region}` : ""}</small></td><td>{event.mode === "hybrid" ? "混合" : event.mode === "ai" ? "AI" : "规则"}</td><td>{scoreLabel(event.score)}{event.threshold !== undefined && <small> / {scoreLabel(event.threshold)}</small>}</td><td>{event.matchedRules.length ? event.matchedRules.map((rule) => rule.ruleId).join(", ") : "—"}</td><td>{formatTime(event.createdAt)}</td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap"><table><thead><tr><th>动作</th><th>请求</th><th>来源</th><th>模式</th><th>Jev 分数</th><th>规则命中</th><th>时间</th></tr></thead><tbody>{events.map((event) => <tr key={event.id} onClick={() => onSelect(event)}><td><span className={`status-badge ${event.action === "allow" ? "green" : event.action === "block" ? "red" : "amber"}`}>{event.action === "allow" ? "放行" : event.action === "block" ? "拦截" : "错误"}</span></td><td><strong>{event.method} {event.path}</strong><small>{event.requestId.slice(0, 12)}</small></td><td><strong>{event.ip ?? "unknown"}</strong><small>{event.country ?? "未知地区"}{event.region ? ` · ${event.region}` : ""}</small></td><td>{event.mode === "hybrid" ? "混合" : event.mode === "ai" ? "AI" : "规则"}</td><td>{scoreLabel(event.score)}{event.threshold !== undefined && <small> / {scoreLabel(event.threshold)}</small>}</td><td>{event.matchedRules.length ? event.matchedRules.map((rule) => rule.ruleId).join(", ") : "—"}</td><td>{formatTime(event.createdAt)}</td></tr>)}</tbody></table></div>;
 }
 
 function EventDetails({ event, onClose }: { event: EventRecord; onClose: () => void }) {
-  return <div className="modal-backdrop" role="presentation" onClick={onClose}><aside className="event-drawer" role="dialog" aria-label="事件详情" onClick={(eventClick) => eventClick.stopPropagation()}>
-    <div className="drawer-head"><div><p className="eyebrow">事件详情</p><h2>{event.method} {event.path}</h2></div><button className="icon-button" title="关闭详情" onClick={onClose}><X size={16} /></button></div>
+  const [seed, setSeed] = useState<ExceptionSeed | undefined>();
+  const [dirty, setDirty] = useState(false);
+  const close = () => { if (!dirty || window.confirm("例外有未保存修改，确定关闭吗？")) onClose(); };
+  const [rules, setRules] = useState<Rule[]>([]);
+  useEffect(() => { void api<{ data: Rule[] }>("/api/v1/rules").then((result) => setRules(result.data)).catch(() => {}); }, []);
+  return <div className="modal-backdrop" role="presentation" onClick={close}><aside className="event-drawer" role="dialog" aria-label="事件详情" onClick={(eventClick) => eventClick.stopPropagation()}>
+    <div className="drawer-head"><div><p className="eyebrow">事件详情</p><h2>{event.method} {event.path}</h2></div><button className="icon-button" title="关闭详情" onClick={close}><X size={16} /></button></div>
     <div className="detail-grid"><span>动作</span><strong>{event.action === "block" ? "已拦截" : event.action === "allow" ? "已放行" : "错误"}</strong><span>Request ID</span><code>{event.requestId}</code><span>来源</span><strong>{event.ip ?? "未知 IP"}</strong><span>地区</span><strong>{[event.country, event.region, event.city].filter(Boolean).join(" · ") || "未知地区"}</strong><span>ASN</span><strong>{event.asn ? `AS${event.asn}` : "未知"}</strong><span>Jev</span><strong>{scoreLabel(event.score)}{event.threshold !== undefined ? ` / ${scoreLabel(event.threshold)}` : ""}</strong><span>状态码</span><strong>{event.statusCode ?? "—"}</strong><span>原因</span><strong>{event.reason}</strong></div>
+    <div className="detail-grid"><span>站点 / 入口</span><strong>{event.siteId ?? "unknown"}{event.listenPort ? ` · :${event.listenPort}` : ""}</strong><span>策略版本</span><strong>{event.policyRevision ?? "未知"}</strong><span>检测模块</span><strong>{event.module ?? "未知"}</strong><span>本地检查</span><strong>{event.localInspectionComplete ? "完整" : "未完整执行"}</strong><span>AI 检查</span><strong>{event.aiInspectionComplete === undefined ? "未调用" : event.aiInspectionComplete ? "完整" : `不完整 · ${event.aiOmittedReason ?? "未知"}`}</strong><span>观察命中</span><strong>{event.wouldBlock ? "是" : "否"}</strong><span>应用例外</span><strong>{event.exceptionIds?.join(", ") || "无"}</strong></div>
     <div className="detail-section"><h3>命中规则</h3>{event.matchedRules.length ? event.matchedRules.map((rule) => <div className="detail-rule" key={rule.ruleId}><strong>{rule.ruleId}</strong><span>{rule.name} · {rule.category}</span></div>) : <span className="panel-meta">没有规则命中</span>}</div>
     <div className="detail-section"><h3>AI 状态</h3><pre>{event.ai ? JSON.stringify(event.ai, null, 2) : "没有 AI 决策"}</pre></div>
+    <div className="detail-section"><h3>字段证据</h3>{event.matchedRules.map((rule) => <div className="detail-rule" key={rule.ruleId}><strong>{rule.ruleId} · {rule.target}:{rule.field || "未知字段"}</strong><span>{rule.snippet ?? "[OMITTED]"}</span>{event.siteId && event.siteId !== "unknown" && rule.field && ["body", "query", "header", "cookie"].includes(rule.target ?? "") && <button className="secondary-button" onClick={() => setSeed({ method: event.method, path: event.path.split("?", 1)[0]!, ruleId: rule.ruleId, field: rule.field!, target: rule.target! })}><Plus size={15} />创建精确例外</button>}</div>)}</div>
+    {seed && event.siteId && <ScopedRules api={api} siteId={event.siteId} kind="exceptions" rules={rules} seed={seed} onDirtyChange={setDirty} />}
   </aside></div>;
 }
 

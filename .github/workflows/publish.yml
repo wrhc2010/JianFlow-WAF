@@ -53,4 +53,5 @@ jobs:
         run: |
           docker pull "$IMAGE"
           docker save "$IMAGE" | gzip -1 > "$ASSET"
-          gh release upload "${{ github.ref_name }}" "$ASSET" --repo "${{ github.repository }}" --clobber
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          gh release upload "${{ github.ref_name }}" "$ASSET" "$ASSET.sha256" --repo "${{ github.repository }}" --clobber

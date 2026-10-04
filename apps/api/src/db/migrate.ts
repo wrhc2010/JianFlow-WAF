@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS jev_base_url TEXT NOT NULL DEFAULT 'https://openrouter.ai';
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS listen_port INTEGER;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS policy JSONB;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS api_key_ciphertext TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_salt TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_hash TEXT;
@@ -89,6 +91,11 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS asn INTEGER;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS finalized BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS default_policy JSONB;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS site_id TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS context JSONB NOT NULL DEFAULT '{}'::jsonb;
+CREATE TABLE IF NOT EXISTS scoped_rules (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, kind TEXT NOT NULL, value JSONB NOT NULL);
+CREATE INDEX IF NOT EXISTS scoped_rules_site_idx ON scoped_rules(site_id,kind);
 
 CREATE TABLE IF NOT EXISTS builtin_rule_catalog (id TEXT PRIMARY KEY);
 WITH older AS (
@@ -97,11 +104,19 @@ WITH older AS (
 )
 UPDATE events SET finalized = FALSE FROM older WHERE events.id = older.id AND older.position > 1;
 CREATE UNIQUE INDEX IF NOT EXISTS events_final_request_idx ON events (request_id) WHERE finalized;
+CREATE TABLE IF NOT EXISTS event_totals (id INTEGER PRIMARY KEY CHECK(id=1), total BIGINT NOT NULL,
+  allowed BIGINT NOT NULL, blocked BIGINT NOT NULL, errors BIGINT NOT NULL, ai BIGINT NOT NULL,
+  traditional BIGINT NOT NULL, hybrid BIGINT NOT NULL, ai_unavailable BIGINT NOT NULL);
+INSERT INTO event_totals SELECT 1,count(*),count(*) FILTER(WHERE action='allow'),count(*) FILTER(WHERE action='block'),
+  count(*) FILTER(WHERE action='error'),count(*) FILTER(WHERE mode='ai'),count(*) FILTER(WHERE mode='traditional'),
+  count(*) FILTER(WHERE mode='hybrid'),count(*) FILTER(WHERE (ai->>'available')::boolean=FALSE) FROM events WHERE finalized
+  ON CONFLICT(id) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS events_created_at_idx ON events (created_at DESC);
 CREATE INDEX IF NOT EXISTS events_action_idx ON events (action);
 CREATE INDEX IF NOT EXISTS events_country_idx ON events (country);
 CREATE INDEX IF NOT EXISTS events_ip_idx ON events (ip);
+CREATE INDEX IF NOT EXISTS events_site_time_idx ON events (site_id, created_at DESC, id DESC);
 `;
 
 export async function migrate(): Promise<void> {

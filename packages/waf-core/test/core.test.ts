@@ -40,7 +40,7 @@ test("redacts sensitive query and nested JSON fields before contacting Jev", () 
   assert.match(state, /admin/);
 });
 
-test("includes inspectable text body formats in the AI state", () => {
+test("omits unstructured body formats from AI state", () => {
   const state = buildAiState({
     method: "POST",
     path: "/upload",
@@ -48,7 +48,7 @@ test("includes inspectable text body formats in the AI state", () => {
     headers: { "content-type": "text/plain" },
     body: "sensitive plain text"
   }, 1000);
-  assert.match(state, /sensitive plain text/);
+  assert.doesNotMatch(state, /sensitive plain text/);
 });
 
 test("normalizes Unicode and repeated URL encoding for traditional rules", () => {
