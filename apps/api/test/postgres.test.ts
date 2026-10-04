@@ -139,7 +139,10 @@ test("real PostgreSQL migration, restart, all-history metrics and failure atomic
   await restarted.saveSite({ ...site, policy });
   const exception = await restarted.saveScopedRule(site.id, "exceptions", { name: "Editor", method: "POST", path: "/editor", target: "body", selector: "template",
     ruleIds: [BUILTIN_RULES[0]!.id], expiresAt: "2099-01-01T00:00:00Z", reason: "Verified template field", enabled: true });
+  const timestampedSite = await restarted.saveSite({ name: "Stable creation time", listenPort: 8086, mode: "traditional", enabled: false, upstreamUrl: "http://127.0.0.1:9106" });
+  assert.equal((await db.query("SELECT created_at FROM sites WHERE id=$1", [timestampedSite.id])).rows[0].created_at.toISOString(), timestampedSite.createdAt);
   const policyRestart = new Store(); stores.push(policyRestart); await policyRestart.init();
+  assert.equal(policyRestart.listSites().find((entry) => entry.id === timestampedSite.id)!.createdAt, timestampedSite.createdAt);
   assert.equal(policyRestart.effectivePolicy(policyRestart.listSites()[0]!).customThreshold, 0.37);
   assert.equal(policyRestart.listScopedRules(site.id, "exceptions")[0]!.id, exception.id);
   assert.equal(await policyRestart.pruneEvents("2099-01-01T00:00:00Z"), 1000);

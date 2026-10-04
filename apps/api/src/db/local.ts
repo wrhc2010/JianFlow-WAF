@@ -89,14 +89,18 @@ export class LocalDatabase {
     if (cursor) { conditions.push("(json_extract(value,'$.createdAt'),id) < (?,?)"); params.push(cursor.time, Number(cursor.id)); }
     if (filters.action) add("json_extract(value,'$.action') = ?", filters.action);
     if (filters.ip) add("json_extract(value,'$.ip') = ?", filters.ip);
-    if (filters.siteId) add("json_extract(value,'$.siteId') = ?", filters.siteId);
+    if (filters.siteId) add(filters.siteId === "unknown"
+      ? "coalesce(json_extract(value,'$.siteId'),'unknown') = ?" : "json_extract(value,'$.siteId') = ?", filters.siteId);
     if (filters.since) add("json_extract(value,'$.createdAt') >= ?", new Date(filters.since).toISOString());
     if (filters.until) add("json_extract(value,'$.createdAt') <= ?", new Date(filters.until).toISOString());
     if (filters.search) add("instr(lower(json_extract(value,'$.path') || ' ' || json_extract(value,'$.requestId') || ' ' || coalesce(json_extract(value,'$.ip'),'')),lower(?)) > 0", filters.search);
     params.push(Math.min(filters.limit ?? 50, 500) + 1);
     return this.db.prepare(`SELECT id,value FROM events ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
       ORDER BY json_extract(value,'$.createdAt') DESC,id DESC LIMIT ?`).all(...params)
-      .map((row) => ({ ...JSON.parse(String(row.value)) as EventRecord, id: Number(row.id) }));
+      .map((row) => {
+        const event = JSON.parse(String(row.value)) as EventRecord;
+        return { ...event, siteId: event.siteId ?? "unknown", id: Number(row.id) };
+      });
   }
 
   summary(): Record<string, number> {

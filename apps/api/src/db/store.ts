@@ -548,12 +548,12 @@ export class Store {
         if (client) {
           await client.query("BEGIN");
           await client.query(
-            `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled, policy, revision)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled, policy, revision, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, listen_port = EXCLUDED.listen_port,
              upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled,
              policy = EXCLUDED.policy, revision = EXCLUDED.revision`,
-            [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled, site.policy ? JSON.stringify(site.policy) : null, site.revision]
+            [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled, site.policy ? JSON.stringify(site.policy) : null, site.revision, site.createdAt]
           );
           if (site.id === "default") {
             await client.query(

@@ -13,6 +13,7 @@ import { createApp } from "../src/app.js";
 import { ProxyListenerManager } from "../src/proxy-manager.js";
 import { classifyWithJev, aiRuntime } from "../src/jev.js";
 import { TrafficControl } from "../src/traffic-control.js";
+import { LocalDatabase } from "../src/db/local.js";
 
 async function listen(server: http.Server): Promise<number> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -89,6 +90,19 @@ test("token buckets enforce burst, critical paths, concurrency, temporary bans a
   assert.ok(control.snapshot().trackedClients <= 3);
   const clean = control.enter("a", "other", "/", policy, 300000); assert.ok(clean.allowed); clean.release();
   config.maxTrackedClients = original;
+});
+
+test("legacy SQLite events remain queryable as unknown without fabricating a site", () => {
+  configureLocal();
+  const database = new LocalDatabase(config.dataDir);
+  try {
+    database.saveEvent({ id: 0, requestId: "legacy-event", action: "allow", mode: "traditional", method: "GET", path: "/legacy",
+      ip: undefined, statusCode: 200, score: undefined, threshold: undefined, reason: "legacy", matchedRules: [], ai: undefined,
+      partialInspection: false, createdAt: new Date().toISOString() });
+    assert.equal(database.listEvents({}, undefined)[0]!.siteId, "unknown");
+    assert.equal(database.listEvents({ siteId: "unknown" }, undefined).length, 1);
+    assert.equal(database.listEvents({ siteId: "default" }, undefined).length, 0);
+  } finally { database.close(); }
 });
 
 test("shutdown drains bounded shadow event writes and retention keeps historical totals", async () => {
