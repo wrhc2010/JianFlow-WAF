@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { config } from "../src/config.js";
 import { parseThreatFeed } from "../src/threat-feed.js";
 import { previewNginxConfig } from "../src/nginx-import.js";
 import { WaitRoom } from "../src/wait-room.js";
@@ -47,4 +50,17 @@ test("wait room grants active requests FIFO and rejects a full queue", async () 
   assert.equal(admitted.allowed, true);
   admitted.release();
   assert.deepEqual(room.snapshot(), { active: 0, queued: 0 });
+});
+
+test("custom page files are restricted to the data pages directory", async () => {
+  const { Store } = await import("../src/db/store.js");
+  const store = new Store();
+  const root = join(config.dataDir, "pages");
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, "maintenance.html"), "<h1>maintenance</h1>", "utf8");
+  assert.equal(store.readPage({ source: "file", filePath: "maintenance.html", statusCode: 503 }), "<h1>maintenance</h1>");
+  assert.equal(store.readPage({ source: "file", filePath: "../jianflow.sqlite", statusCode: 503 }), undefined);
+  assert.equal(store.readPage({ source: "file", filePath: "maintenance.txt", statusCode: 503 }), undefined);
+  await store.close();
+  rmSync(join(config.dataDir, "pages"), { recursive: true, force: true });
 });

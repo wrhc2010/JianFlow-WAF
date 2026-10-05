@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { resolve, relative, sep } from "node:path";
 import { Pool, type QueryResultRow } from "pg";
 import {
   BUILTIN_RULES,
@@ -522,8 +523,12 @@ export class Store {
   readPage(page: PageConfig | undefined): string | undefined {
     if (!page || page.source !== "file" || !page.filePath) return page?.html;
     try {
-      if (!existsSync(page.filePath)) return undefined;
-      const body = readFileSync(page.filePath);
+      const root = resolve(config.dataDir, "pages");
+      const target = resolve(root, page.filePath);
+      const relation = relative(root, target);
+      if (relation.startsWith(`..${sep}`) || relation === ".." || !existsSync(target)) return undefined;
+      if (!target.toLowerCase().endsWith(".html")) return undefined;
+      const body = readFileSync(target);
       if (body.length > 512 * 1024) return undefined;
       return body.toString("utf8");
     } catch { return undefined; }
