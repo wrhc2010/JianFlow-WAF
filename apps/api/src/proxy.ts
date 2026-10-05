@@ -15,6 +15,7 @@ import { Store, type Site } from "./db/store.js";
 import { inspectBody } from "./body-inspection.js";
 import { TrafficControl } from "./traffic-control.js";
 import { WaitRoom } from "./wait-room.js";
+import { verifyToken } from "./captcha.js";
 export { isIpInCidr } from "@jev-waf/core";
 
 const proxy = httpProxy.createProxyServer({ changeOrigin: true, xfwd: false, proxyTimeout: 30000 });
@@ -194,6 +195,13 @@ function runtimeBan(store: Store, siteId: string, ip: string | undefined): numbe
   const stored = typeof store.getRuntimeBan === "function" ? store.getRuntimeBan(siteId, ip) : undefined;
   if (stored) return Math.max(1, Math.ceil((stored.until - Date.now()) / 1000));
   return control(store).isBanned(siteId, ip);
+}
+
+function captchaRequired(store: Store, request: http.IncomingMessage, siteId: string, ip: string | undefined): boolean {
+  const captcha = store.getSettings().captcha ?? { enabled: false, provider: "local" as const };
+  if (!captcha.enabled || captcha.provider !== "local" || !ip) return false;
+  const token = typeof request.headers["x-jev-captcha-token"] === "string" ? request.headers["x-jev-captcha-token"] : undefined;
+  return !token || !verifyToken(siteId, ip, token);
 }
 
 function pageResponse(store: Store, response: http.ServerResponse, page: Site["maintenance"] | Site["upstreamError"], status: number, title: string, requestId: string): void {
@@ -396,6 +404,10 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "来源 IP 暂时封禁", module: "async-ai", localInspectionComplete: true };
       request.resume(); response.setHeader("retry-after", activeBan); blockResponse(response, 403, decision.reason, requestId); return;
     }
+    if (captchaRequired(store, request, site?.id ?? "default", wafRequest.ip)) {
+      decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "需要完成人机验证", module: "captcha", localInspectionComplete: true };
+      request.resume(); blockResponse(response, 403, decision.reason, requestId); return;
+    }
     const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy);
     release = admission.release;
     if (!admission.allowed) {
@@ -498,6 +510,7 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
     if (access.decision) { decision = access.decision; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
     const activeBan = runtimeBan(store, site?.id ?? "default", wafRequest.ip);
     if (activeBan && !isWhitelisted(store, wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "来源 IP 暂时封禁", module: "async-ai" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId, activeBan); return; }
+    if (captchaRequired(store, request, site?.id ?? "default", wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "需要完成人机验证", module: "captcha" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
     const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy);
     release = admission.release;
     if (!admission.allowed) {

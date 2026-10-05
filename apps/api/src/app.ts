@@ -24,6 +24,8 @@ import { ConflictError, SetupConflictError, ValidationError } from "./errors.js"
 import { policySchema, parsePolicy } from "./policy-validation.js";
 import { aiRuntime } from "./jev.js";
 import { trafficRuntime } from "./proxy.js";
+import { clientIp } from "./proxy.js";
+import { createChallenge, verifyChallenge } from "./captcha.js";
 import type { SitePolicy, RuleException, AccessRule } from "@jev-waf/core";
 import type { Site, AiProfileInput } from "./db/store.js";
 
@@ -87,6 +89,32 @@ export async function createApp(store: Store, logger = true) {
   });
 
   app.get("/api/v1/setup/status", async () => store.setupStatus());
+
+  app.get<{ Params: { siteId: string } }>("/api/v1/captcha/challenge/:siteId", {
+    schema: { params: { type: "object", required: ["siteId"], additionalProperties: false, properties: { siteId: { type: "string", minLength: 1, maxLength: 128 } } } },
+  }, async (request, reply) => {
+    const settings = store.getSettings();
+    if (!settings.captcha.enabled || settings.captcha.provider !== "local") return reply.code(404).send({ detail: "本地挑战未启用" });
+    if (!store.listSites().some((site) => site.id === request.params.siteId && site.enabled)) return notFound(reply, "站点不存在", request.url);
+    const ip = clientIp(request.raw);
+    if (!ip) return reply.code(400).send({ detail: "无法识别客户端地址" });
+    return createChallenge(request.params.siteId, ip);
+  });
+  app.post<{ Params: { siteId: string }; Body: { challenge: string; answer: string } }>("/api/v1/captcha/verify/:siteId", {
+    schema: {
+      params: { type: "object", required: ["siteId"], additionalProperties: false, properties: { siteId: { type: "string", minLength: 1, maxLength: 128 } } },
+      body: { type: "object", required: ["challenge", "answer"], additionalProperties: false, properties: { challenge: { type: "string", minLength: 1, maxLength: 128 }, answer: { type: "string", minLength: 1, maxLength: 32 } } },
+    },
+  }, async (request, reply) => {
+    const settings = store.getSettings();
+    if (!settings.captcha.enabled || settings.captcha.provider !== "local") return reply.code(404).send({ detail: "本地挑战未启用" });
+    if (!store.listSites().some((site) => site.id === request.params.siteId && site.enabled)) return notFound(reply, "站点不存在", request.url);
+    const ip = clientIp(request.raw);
+    if (!ip) return reply.code(400).send({ detail: "无法识别客户端地址" });
+    const token = verifyChallenge(request.params.siteId, ip, request.body?.challenge ?? "", request.body?.answer ?? "");
+    if (!token) return reply.code(403).send({ detail: "挑战答案无效或已过期" });
+    return { token, expiresInSeconds: 600 };
+  });
 
   app.post<{ Body: { password?: string; confirmPassword?: string } }>(
     "/api/v1/setup",
@@ -184,7 +212,8 @@ export async function createApp(store: Store, logger = true) {
     if (
       request.url.startsWith("/api/v1/health") ||
       request.url.startsWith("/api/v1/setup") ||
-      request.url.startsWith("/api/v1/auth/")
+      request.url.startsWith("/api/v1/auth/") ||
+      request.url.startsWith("/api/v1/captcha/")
     )
       return;
     if (!store.setupStatus().initialized) {

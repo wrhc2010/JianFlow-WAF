@@ -64,3 +64,14 @@ test("custom page files are restricted to the data pages directory", async () =>
   await store.close();
   rmSync(join(config.dataDir, "pages"), { recursive: true, force: true });
 });
+
+test("local captcha issues a short-lived token bound to site and IP", async () => {
+  const { createChallenge, verifyChallenge, verifyToken, clearChallenges } = await import("../src/captcha.js");
+  const challenge = createChallenge("site-a", "203.0.113.10");
+  const answer = challenge.question.split("=")[0]!.split("+").map((value) => Number(value.trim())).reduce((sum, value) => sum + value, 0);
+  const token = verifyChallenge("site-a", "203.0.113.10", challenge.challenge, String(answer));
+  assert.ok(token);
+  assert.equal(verifyToken("site-a", "203.0.113.10", token!), true);
+  assert.equal(verifyToken("site-b", "203.0.113.10", token!), false);
+  clearChallenges();
+});
