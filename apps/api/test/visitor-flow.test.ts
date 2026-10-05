@@ -104,6 +104,34 @@ test("browser waiting tickets preserve FIFO, isolate custom HTML and honor queue
   assert.equal((await get(port, "/.jianflow/wait/status", { cookie })).status, 410);
 });
 
+for (const scenario of [
+  { name: "trusted HTTPS", trusted: true, proto: "https", secure: true },
+  { name: "trusted HTTP", trusted: true, proto: "http", secure: false },
+  { name: "forged HTTPS", trusted: false, proto: "https", secure: false },
+  { name: "ambiguous protocol", trusted: true, proto: "https,http", secure: false },
+]) {
+  test(`waiting tickets use Secure only for ${scenario.name}`, { timeout: 10000 }, async (t) => {
+    const { port, change } = await fixture(t);
+    config.trustedProxyCidrs = scenario.trusted ? ["127.0.0.1/32"] : [];
+    await change({ waitRoom: { enabled: true, maxActive: 1, maxQueue: 1, timeoutSeconds: 5 } });
+    const active = http.get({ host: "127.0.0.1", port, path: "/hold" });
+    active.on("error", () => {});
+    const [response] = await once(active, "response") as [http.IncomingMessage];
+    try {
+      const headers = { accept: "text/html", "x-forwarded-proto": scenario.proto };
+      const queued = await get(port, "/", headers);
+      assert.equal(queued.status, 202);
+      const signedCookie = queued.headers["set-cookie"]![0]!;
+      assert.equal(/; Secure(?:;|$)/.test(signedCookie), scenario.secure);
+      assert.match(signedCookie, /; HttpOnly;/);
+      assert.match(signedCookie, /; SameSite=Lax;/);
+      const repeated = await get(port, "/", { ...headers, cookie: signedCookie.split(";")[0]! });
+      assert.equal(repeated.status, 202);
+      assert.equal(/; Secure(?:;|$)/.test(repeated.headers["set-cookie"]![0]!), scenario.secure);
+    } finally { response.destroy(); active.destroy(); }
+  });
+}
+
 test("visitor PoW verifies once, clears CC bans and strips clearance before forwarding", { timeout: 10000 }, async (t) => {
   const { store, port, change } = await fixture(t);
   await store.updateSettings({ captcha: { enabled: true, provider: "local", siteKey: "", secretConfigured: false, trigger: "cc" } });

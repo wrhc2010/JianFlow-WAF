@@ -18,6 +18,7 @@ import { WaitRoom } from "./wait-room.js";
 import { captchaPage, createChallenge, issueToken, verifyChallenge, verifyProvider, verifyToken } from "./captcha.js";
 import { defaultPage } from "./pages.js";
 import { browserWaitResponse, repeatWaitingResponse, takeWaitingAdmission, waitStatus } from "./browser-wait-room.js";
+import { secureRequest } from "./request-security.js";
 export { isIpInCidr } from "@jev-waf/core";
 
 const proxy = httpProxy.createProxyServer({ changeOrigin: true, xfwd: false, proxyTimeout: 30000 });
@@ -176,12 +177,6 @@ export function clientIp(request: http.IncomingMessage, trustedCidrs = config.tr
   let current = normalizedRemote;
   for (let index = chain.length - 1; index >= 0 && trusted(current); index -= 1) current = chain[index]!;
   return current;
-}
-
-function secureRequest(request: http.IncomingMessage): boolean {
-  if ("encrypted" in request.socket && request.socket.encrypted) return true;
-  const remote = request.socket.remoteAddress?.replace(/^::ffff:/i, "");
-  return Boolean(remote && config.trustedProxyCidrs.some((cidr) => isIpInCidr(remote, cidr)) && request.headers["x-forwarded-proto"] === "https");
 }
 
 function validateRequestFraming(request: http.IncomingMessage): void {
