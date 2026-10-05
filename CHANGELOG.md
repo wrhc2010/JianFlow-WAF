@@ -12,6 +12,7 @@
 - 侧边栏支持展开和收缩，收缩后保留图标、提示和键盘可访问性；内容区独立滚动。
 - 站点、策略、等候室和错误页继续采用草稿、保存、取消的配置语义。
 - 增加 API Profile 管理、GeoIP 文件保存、IP 库预览和 Nginx 导入历史。
+- 修复站点和 Profile 弹窗关闭后焦点无法返回原按钮的问题，补充 Tab、Shift+Tab 和 Escape 验证。
 - 修正手机上的 3D 地球取景，地图不依赖在线资源；覆盖三个视口的主题、导航和 canvas 像素/交互验收。
 
 ### 站点与防护
@@ -25,6 +26,7 @@
 - Jev Profile 使用独立模型、Base URL、Key、超时和失败策略；Key 与验证码 Secret 加密保存，不回显。
 - 异步审核先放行本地规则通过的请求，判恶意后追封并中断活动 HTTP/WebSocket；封禁递增次数跨重启保留，白名单不追封。
 - 增加 CC 人机验证、本地签名 PoW，以及 Turnstile/hCaptcha/reCAPTCHA v2 校验协议和故障策略。真实供应商账号需要部署者自行验收。
+- CC 独立支持阻断和仅记录，旧配置继续阻断；修复规则观察意外放开 HTTP/WebSocket 限速的问题，并验证两种数据库重启持久化。
 - 白名单/恶意库支持 CIDR、JSON、CSV、STIX 和 TAXII envelope；GeoIP 支持 City/ASN MMDB 上传和挂载。
 - 大文件管理请求在解析正文前鉴权。
 

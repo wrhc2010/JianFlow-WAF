@@ -5,7 +5,7 @@ export type { SitePolicy };
 export const initialPolicy: SitePolicy = {
   enforcement: "enforce", strength: "medium", customThreshold: 0.5, disabledRuleIds: [], aiBehavior: "enforce",
   aiScope: "suspicious", aiFailureAction: "inherit", aiIncompleteAction: "local", aiBodyFields: [],
-  rateLimit: { enabled: false, requestsPerSecond: 20, burst: 40, maxConcurrent: 50, blockSeconds: 10, paths: [] }
+  rateLimit: { enabled: false, action: "block", requestsPerSecond: 20, burst: 40, maxConcurrent: 50, blockSeconds: 10, paths: [] }
 };
 type Api = <T>(path: string, init?: RequestInit) => Promise<T>;
 type RuleOption = { id: string; name: string };
@@ -20,6 +20,7 @@ export function PolicyFields({ policy, onChange, rateOnly = false, disabled = fa
   return <fieldset className="policy-fields" disabled={disabled}>
     {rateOnly ? <>
       <label className="check-label"><input type="checkbox" checked={limits.enabled} onChange={(event) => rate({ enabled: event.target.checked })} />业务入口限速</label>
+      <label className="field-label">CC 超限处理<select value={limits.action ?? "block"} onChange={(event) => rate({ action: event.target.value as "block" | "observe" })}><option value="block">阻断并临时封禁</option><option value="observe">仅记录</option></select></label>
       <div className="form-grid">
         <label className="field-label">每 IP 每秒请求<input type="number" min="0.1" max="10000" step="0.1" value={limits.requestsPerSecond} onChange={(event) => rate({ requestsPerSecond: Number(event.target.value) })} /></label>
         <label className="field-label">突发容量<input type="number" min="1" max="10000" value={limits.burst} onChange={(event) => rate({ burst: Number(event.target.value) })} /></label>

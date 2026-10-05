@@ -566,7 +566,7 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "需要完成人机验证", module: "captcha", localInspectionComplete: true };
       request.resume(); challengeResponse(store, response, requestId, site?.id ?? "default"); return;
     }
-    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy, Date.now(), { whitelisted: isWhitelisted(store, wafRequest.ip), observe: site?.operationMode === "record" || policy.enforcement === "observe" });
+    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy, Date.now(), { whitelisted: isWhitelisted(store, wafRequest.ip), observe: site?.operationMode === "record" });
     release = admission.release;
     if (!admission.allowed) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: admission.reason ?? "限速", module: "cc", localInspectionComplete: false };
@@ -714,7 +714,7 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
     const activeBan = runtimeBan(store, site?.id ?? "default", wafRequest.ip);
     if (activeBan && site?.operationMode !== "record" && !isWhitelisted(store, wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "来源 IP 暂时封禁", module: "async-ai" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId, activeBan); return; }
     if (settings.captcha?.trigger !== "cc" && site?.operationMode !== "record" && captchaRequired(store, request, site?.id ?? "default", wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "需要完成人机验证", module: "captcha" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
-    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy, Date.now(), { whitelisted: isWhitelisted(store, wafRequest.ip), observe: site?.operationMode === "record" || policy.enforcement === "observe" });
+    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy, Date.now(), { whitelisted: isWhitelisted(store, wafRequest.ip), observe: site?.operationMode === "record" });
     release = admission.release;
     if (!admission.allowed) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: admission.reason ?? "限速", module: "cc" };

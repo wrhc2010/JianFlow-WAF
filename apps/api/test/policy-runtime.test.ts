@@ -14,6 +14,7 @@ import { ProxyListenerManager } from "../src/proxy-manager.js";
 import { classifyWithJev, aiRuntime } from "../src/jev.js";
 import { TrafficControl } from "../src/traffic-control.js";
 import { LocalDatabase } from "../src/db/local.js";
+import { parsePolicy } from "../src/policy-validation.js";
 
 async function listen(server: http.Server): Promise<number> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -90,6 +91,61 @@ test("token buckets enforce burst, critical paths, concurrency, temporary bans a
   assert.ok(control.snapshot().trackedClients <= 3);
   const clean = control.enter("a", "other", "/", policy, 300000); assert.ok(clean.allowed); clean.release();
   config.maxTrackedClients = original;
+});
+
+test("CC actions validate independently and legacy policies default to blocking", () => {
+  const legacy = defaultPolicy();
+  delete legacy.rateLimit.action;
+  assert.equal(parsePolicy(legacy).rateLimit.action, "block");
+  assert.equal(legacy.rateLimit.action, undefined);
+  const observe = { ...legacy, rateLimit: { ...legacy.rateLimit, action: "observe" } };
+  assert.equal(parsePolicy(observe).rateLimit.action, "observe");
+  assert.throws(() => parsePolicy({ ...observe, rateLimit: { ...observe.rateLimit, action: "allow" } }), /策略无效/);
+});
+
+test("CC observation reports excess without a ban and resumes blocking when switched", () => {
+  const control = new TrafficControl();
+  const policy = defaultPolicy();
+  Object.assign(policy.rateLimit, { enabled: true, action: "observe", requestsPerSecond: 0.1, burst: 2, maxConcurrent: 1, blockSeconds: 60 });
+  const first = control.enter("a", "one", "/", policy, 10000);
+  const concurrent = control.enter("a", "one", "/", policy, 10000);
+  assert.equal(first.allowed, true);
+  assert.equal(concurrent.allowed, true);
+  assert.equal(concurrent.reason, "client_concurrency");
+  first.release(); concurrent.release();
+  const second = control.enter("a", "one", "/", policy, 10000); second.release();
+  const excess = control.enter("a", "one", "/", policy, 10000);
+  assert.equal(excess.allowed, true);
+  assert.equal(excess.reason, "request_rate");
+  assert.equal(control.isBanned("a", "one", 10000), 0);
+  excess.release();
+  policy.rateLimit.action = "block";
+  const blocked = control.enter("a", "one", "/", policy, 10000);
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.reason, "request_rate");
+  assert.equal(control.isBanned("a", "one", 10000), 60);
+  policy.rateLimit.action = "observe";
+  const observed = control.enter("a", "one", "/", policy, 10000);
+  assert.equal(observed.allowed, true); observed.release();
+  policy.rateLimit.action = "block";
+  assert.equal(control.enter("a", "one", "/", policy, 10000).reason, "temporary_ban");
+});
+
+test("CC observation and record mode never bypass hard resource capacity", (t) => {
+  const previous = { maxProxyConcurrent: config.maxProxyConcurrent, maxTrackedClients: config.maxTrackedClients };
+  t.after(() => Object.assign(config, previous));
+  config.maxProxyConcurrent = 1; config.maxTrackedClients = 1;
+  const control = new TrafficControl();
+  const policy = defaultPolicy();
+  Object.assign(policy.rateLimit, { enabled: true, action: "observe" });
+  const first = control.enter("a", "one", "/", policy, 10000);
+  assert.equal(first.allowed, true);
+  assert.equal(control.enter("a", "one", "/", policy, 10000, { observe: true, whitelisted: true }).reason, "global_concurrency");
+  first.release();
+  assert.equal(control.enter("a", "two", "/", policy, 10000, { observe: true }).reason, "tracked_client_limit");
+  const whitelisted = control.enter("a", "two", "/", policy, 10000, { whitelisted: true });
+  assert.equal(whitelisted.allowed, true); whitelisted.release();
+  assert.deepEqual(control.snapshot(), { concurrent: 0, trackedClients: 1, maxTrackedClients: 1 });
 });
 
 test("legacy SQLite events remain queryable as unknown without fabricating a site", () => {

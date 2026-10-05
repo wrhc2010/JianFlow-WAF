@@ -149,3 +149,38 @@ test("upstream HTTP failures return the configured static error page", { timeout
   assert.match(response.body, /Service temporarily unavailable/);
   assert.doesNotMatch(response.body, /raw upstream error/);
 });
+
+for (const protocol of ["http", "websocket"] as const) {
+  test(`${protocol}: rule observation does not silently disable CC enforcement`, { timeout: 10000 }, async (t) => {
+    const { store, port, change } = await fixture(t);
+    const policy = defaultPolicy();
+    policy.enforcement = "observe";
+    policy.rateLimit = { enabled: true, requestsPerSecond: 0.1, burst: 1, maxConcurrent: 1, blockSeconds: 60, paths: [] };
+    await change({ policy });
+    const request = () => protocol === "http" ? get(port).then((response) => response.status) : upgrade(port);
+    assert.equal(await request(), protocol === "http" ? 200 : 101);
+    assert.equal(await request(), 429);
+    await new Promise<void>((done) => setImmediate(done));
+    assert.ok((await store.listEvents()).data.some((event) => event.module === "cc" && event.action === "block"));
+  });
+}
+
+test("CC observation records both protocols without disabling content rules or persistent bans", { timeout: 10000 }, async (t) => {
+  const { store, port, change } = await fixture(t);
+  const policy = defaultPolicy();
+  Object.assign(policy.rateLimit, { enabled: true, action: "observe", requestsPerSecond: 0.1, burst: 1, maxConcurrent: 1, blockSeconds: 60 });
+  const site = await change({ policy });
+  for (let index = 0; index < 3; index++) assert.equal((await get(port)).status, 200);
+  assert.equal(await upgrade(port), 101);
+  await new Promise<void>((done) => setImmediate(done));
+  const events = (await store.listEvents()).data.filter((event) => event.module === "cc" && event.wouldBlock);
+  assert.ok(events.some((event) => event.statusCode === 200));
+  assert.ok(events.some((event) => event.statusCode === 101));
+  assert.equal((await get(port, "/?q=union%20select%20password")).status, 403);
+  assert.equal(await upgrade(port, "/socket?q=union%20select%20password"), 403);
+  await store.recordRuntimeBan(site.id, "127.0.0.1", 60, 60, 3600);
+  assert.equal((await get(port)).status, 403);
+  assert.equal(await upgrade(port), 403);
+  await store.updateSettings({ whitelistCidrs: ["127.0.0.1"] });
+  assert.equal((await get(port)).status, 200);
+});

@@ -53,14 +53,20 @@ test("settings cancel is local, save persists and captcha secrets stay private",
   const before = await page.getByLabel("Jev 模型", { exact: true }).inputValue();
   const writes: string[] = [];
   page.on("request", (request) => { if (request.method() === "PATCH") writes.push(request.url()); });
+  const cc = page.getByRole("combobox", { name: "CC 超限处理", exact: true });
+  await expect(cc).toHaveValue("block");
+  await cc.selectOption("observe");
   await page.getByLabel("Jev 模型", { exact: true }).fill("draft-only");
   await page.getByRole("button", { name: "取消更改", exact: true }).click();
   await expect(page.getByLabel("Jev 模型", { exact: true })).toHaveValue(before);
+  await expect(cc).toHaveValue("block");
   expect(writes).toHaveLength(0);
+  await cc.selectOption("observe");
   await page.getByLabel("Jev 模型", { exact: true }).fill("saved-model");
   await page.getByRole("button", { name: "保存策略", exact: true }).click();
   await expect(page.getByText("策略已保存", { exact: true })).toBeVisible();
   expect(writes.filter((url) => url.endsWith("/settings"))).toHaveLength(1);
+  expect((await (await page.request.get("/api/v1/settings")).json()).defaultPolicy.rateLimit.action).toBe("observe");
   await page.getByRole("button", { name: "新增 Profile", exact: true }).click();
   const profile = page.getByRole("dialog", { name: "编辑 API Profile" });
   await profile.getByLabel("名称", { exact: true }).fill("Browser Profile");
@@ -79,6 +85,37 @@ test("settings cancel is local, save persists and captcha secrets stay private",
   await profile.getByRole("button", { name: "保存 Profile", exact: true }).click();
   await expect(profile).toBeHidden();
   await expect(page.locator(".mode-option").filter({ hasText: "混合模式" })).toBeDisabled();
+});
+
+test("Profile drafts cancel without writes and keyboard focus stays in the dialog", async ({ page }) => {
+  await login(page);
+  await page.getByRole("button", { name: "防护策略", exact: true }).click();
+  const writes: string[] = [];
+  page.on("request", (request) => {
+    if (["POST", "PATCH", "DELETE"].includes(request.method()) && request.url().includes("/ai-profiles")) writes.push(request.url());
+  });
+  const add = page.getByRole("button", { name: "新增 Profile", exact: true });
+  await add.click();
+  const dialog = page.getByRole("dialog", { name: "编辑 API Profile" });
+  await dialog.getByLabel("名称", { exact: true }).fill("Cancelled Profile");
+  await dialog.getByLabel("API Key", { exact: true }).fill("never-submitted-secret");
+  await dialog.getByRole("button", { name: "保存 Profile", exact: true }).focus();
+  await page.keyboard.press("Tab");
+  await expect(dialog.getByRole("button", { name: "关闭", exact: true })).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(dialog.getByRole("button", { name: "保存 Profile", exact: true })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(add).toBeFocused();
+  expect(writes).toHaveLength(0);
+  const row = page.locator(".profile-row").first();
+  const edit = row.getByRole("button", { name: "编辑 Profile" });
+  await edit.click();
+  await dialog.getByLabel("模型", { exact: true }).fill("cancelled-model");
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(edit).toBeFocused();
+  expect(writes).toHaveLength(0);
+  expect(await (await page.request.get("/api/v1/ai-profiles")).text()).not.toContain("cancelled-model");
 });
 
 test("GeoIP files stay local until saved and nginx import requires preview", async ({ page }) => {
@@ -156,6 +193,14 @@ test("site create, custom HTML draft, edit, toggle and delete", async ({ page })
   await dialog.getByLabel("站点名称", { exact: true }).fill("Browser Site");
   await dialog.getByLabel("默认上游地址", { exact: true }).fill("http://127.0.0.1:19999");
   await dialog.getByRole("combobox", { name: "运行模式", exact: true }).selectOption("maintenance");
+  await dialog.getByLabel("启用等候室", { exact: true }).check();
+  await dialog.getByLabel("活动上限", { exact: true }).fill("2");
+  await dialog.getByLabel("队列上限", { exact: true }).fill("3");
+  await dialog.getByLabel("等待超时", { exact: true }).fill("10");
+  await dialog.getByRole("tab", { name: "限速", exact: true }).click();
+  await dialog.getByLabel("继承全局默认", { exact: false }).uncheck();
+  await dialog.getByRole("combobox", { name: "CC 超限处理", exact: true }).selectOption("block");
+  await page.screenshot({ path: resolve(screenshots, "site-cc-editor.png") });
   await dialog.getByRole("tab", { name: "页面", exact: true }).click();
   const maintenance = dialog.locator("fieldset").filter({ has: page.locator("legend", { hasText: "维护页面" }) });
   await maintenance.getByRole("combobox", { name: "页面来源", exact: true }).selectOption("inline");
@@ -168,6 +213,8 @@ test("site create, custom HTML draft, edit, toggle and delete", async ({ page })
   await expect(card.getByText("维护模式", { exact: true })).toBeVisible();
   const sites = (await (await page.request.get("/api/v1/sites")).json()).data;
   const site = sites.find((entry: { name: string }) => entry.name === "Browser Site");
+  expect(site.waitRoom).toMatchObject({ enabled: true, maxActive: 2, maxQueue: 3, timeoutSeconds: 10 });
+  expect(site.policy.rateLimit.action).toBe("block");
   const maintenanceResponse = await page.request.get(`http://127.0.0.1:${site.listenPort}/`);
   expect(maintenanceResponse.status()).toBe(503);
   expect(await maintenanceResponse.text()).toContain("Browser maintenance");
@@ -177,6 +224,7 @@ test("site create, custom HTML draft, edit, toggle and delete", async ({ page })
   page.once("dialog", (confirm) => confirm.accept());
   await edit.getByRole("button", { name: "取消", exact: true }).click();
   await expect(card).toBeVisible();
+  await expect(card.getByRole("button", { name: "编辑站点", exact: true })).toBeFocused();
   await card.getByRole("button", { name: "停用站点" }).click();
   await expect(card.getByText("已停用", { exact: true })).toBeVisible();
   await card.getByRole("button", { name: "启用站点" }).click();

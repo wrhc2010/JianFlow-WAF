@@ -41,6 +41,7 @@ export class TrafficControl {
       this.lastSweep = now;
     }
     const limits = policy.rateLimit;
+    const observe = options.observe || limits.action === "observe";
     let client: Bucket | undefined;
     let observed: string | undefined;
     if (limits.enabled && !options.whitelisted) {
@@ -55,12 +56,12 @@ export class TrafficControl {
         }
         bucket.lastSeen = now;
         if (!client) client = bucket;
-        if (bucket.banUntil > now && !options.observe) return denied("temporary_ban", Math.max(1, Math.ceil((bucket.banUntil - now) / 1000)));
+        if (bucket.banUntil > now && !observe) return denied("temporary_ban", Math.max(1, Math.ceil((bucket.banUntil - now) / 1000)));
         bucket.tokens = Math.min(scope.burst, bucket.tokens + Math.max(0, now - bucket.updated) * scope.rate / 1000);
         bucket.updated = now;
         if (bucket.tokens < 1 || client.active >= limits.maxConcurrent) {
           const reason = bucket.tokens < 1 ? "request_rate" : "client_concurrency";
-          if (!options.observe) {
+          if (!observe) {
             bucket.banUntil = now + limits.blockSeconds * 1000;
             return denied(reason, limits.blockSeconds);
           }

@@ -95,7 +95,7 @@ Use the same two `-f` options for later operations. This does not start PostgreS
 
 The default site always uses port `8080` and cannot be deleted. Create a site, choose an unused port and configure its upstream and mode. Cards show desired and applied revisions, with retry for listener errors. Nginx keeps the range mappings when a site is disabled, but refuses to forward to another site's upstream; disabling the default site also disables its HTTPS business entry.
 
-Site policies can inherit or override thresholds, enforcement, rules, AI scope and rate limits. Policy observation affects detection hits only; mandatory ACL, protocol/body validation and capacity limits remain. Site record mode has a broader scope, described below. Rate limits and queues are in-process, not distributed.
+Site policies can inherit or override thresholds, enforcement, rules, AI scope and rate limits. Rule observation affects detection hits only; CC enforcement, mandatory ACL, protocol/body validation and capacity limits remain. CC observation and site record mode are separate options, described below. Rate limits and queues are in-process, not distributed.
 
 `SITE_PORT_RANGE` is read when the deployment starts and must include the default entry port, `8080`. To extend it to `8080-8109`, update `.env` and restart. The supplied Compose file publishes ports using this variable; update any custom port mapping as well:
 
@@ -206,7 +206,9 @@ Upstream pools support at most 32 nodes, weights 1-1000, and safe-method connect
 
 ### CC and visitor verification
 
-Per-site limits cover requests/second, burst capacity, concurrency, ban duration and selected paths. CAPTCHA can inherit global settings or be enabled/disabled per site. A CC-triggered client receives a local PoW or third-party challenge. Success issues a 10-minute HttpOnly token bound to site and IP, clears the CC ban, but does not bypass rules, threat feeds or asynchronous bans.
+Per-site limits cover requests/second, burst capacity, concurrency, ban duration and selected paths. CC defaults to blocking with a temporary ban. Select **Record only** to forward excess requests, mark their events `wouldBlock`, and avoid creating new CC bans. Content rules, threat feeds, asynchronous bans and hard capacity limits still apply. Configuration files accept `rateLimit.action: "block"` or `"observe"`; older policies without the field keep blocking.
+
+CAPTCHA can inherit global settings or be enabled/disabled per site. A CC-blocked client receives a local PoW or third-party challenge; CC observation alone does not trigger a challenge. Success issues a 10-minute HttpOnly token bound to site and IP, clears the CC ban, but does not bypass rules, threat feeds or asynchronous bans.
 
 Local PoW has no external dependency but requires HTTPS on public domains because it uses `crypto.subtle`; localhost HTTP works for tests. Third-party providers are Turnstile, hCaptcha and reCAPTCHA v2, with Site Key, Secret, timeout and fail-open/fail-closed options. The server calls siteverify and checks hostname. Tests cover the verification protocol and failures; a real account/domain still needs your valid credentials and provider acceptance. Environment defaults use `CAPTCHA_ENABLED`, `CAPTCHA_PROVIDER`, `CAPTCHA_SITE_KEY`, `CAPTCHA_SECRET_KEY`, `CAPTCHA_TIMEOUT_MS` and `CAPTCHA_FAILURE_ACTION`; saved settings take precedence.
 

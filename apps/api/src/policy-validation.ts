@@ -16,7 +16,7 @@ export const policySchema = {
     aiIncompleteAction: { enum: ["local", "block"] }, aiBodyFields: ids,
     rateLimit: { type: "object", additionalProperties: false,
       required: ["enabled", "requestsPerSecond", "burst", "maxConcurrent", "blockSeconds", "paths"],
-      properties: { enabled: { type: "boolean" }, requestsPerSecond: number(0.1, 10000), burst: integer(1, 10000),
+      properties: { enabled: { type: "boolean" }, action: { enum: ["block", "observe"] }, requestsPerSecond: number(0.1, 10000), burst: integer(1, 10000),
         maxConcurrent: integer(1, 10000), blockSeconds: integer(1, 3600),
         paths: { type: "array", maxItems: 100, items: { type: "object", additionalProperties: false,
           required: ["path", "requestsPerSecond", "burst"], properties: { path: { type: "string", minLength: 1, maxLength: 1024 },
@@ -29,6 +29,7 @@ const validatePolicy = ajv.compile(policySchema);
 export function parsePolicy(value: unknown): SitePolicy {
   if (!validatePolicy(value)) throw new ValidationError(`站点策略无效：${ajv.errorsText(validatePolicy.errors)}`);
   const policy = structuredClone(value as SitePolicy);
+  policy.rateLimit.action ??= "block";
   for (const path of policy.rateLimit.paths) validatePath(path.path);
   for (const field of policy.aiBodyFields) validateSelector(field);
   if (new Set(policy.rateLimit.paths.map((entry) => entry.path)).size !== policy.rateLimit.paths.length) throw new ValidationError("限速路径不能重复");

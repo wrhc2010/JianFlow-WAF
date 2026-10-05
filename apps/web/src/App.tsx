@@ -76,6 +76,7 @@ function useDialogFocus(open: boolean, onClose: () => void) {
   useEffect(() => {
     if (!open) return;
     const previous = document.activeElement as HTMLElement | null;
+    ref.current?.querySelector<HTMLElement>("input:not(:disabled), select:not(:disabled), textarea:not(:disabled)")?.focus();
     const keydown = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); close.current(); }
       if (event.key !== "Tab") return;
@@ -1100,7 +1101,7 @@ function SiteEditor(props: {
       <div className="site-tabs" role="tablist">{["入口", "防护", "限速", "页面", "例外", "事件"].map((value) => <button type="button" role="tab" aria-selected={tab === value} disabled={!props.editingId && ["例外", "事件"].includes(value)} className={tab === value ? "selected" : ""} key={value} onClick={() => switchTab(value)}>{value}</button>)}</div>
       <div className="site-editor-body">
         {tab === "入口" && <>
-        <label className="field-label">站点名称<input value={props.form.name} onChange={(event) => props.onChange({ name: event.target.value })} autoFocus /></label>
+        <label className="field-label">站点名称<input value={props.form.name} onChange={(event) => props.onChange({ name: event.target.value })} /></label>
         <label className="field-label">入口端口<select value={props.form.listenPort} onChange={(event) => props.onChange({ listenPort: Number(event.target.value) })}>{props.ports.map((port) => <option key={port} value={port}>:{port}</option>)}</select></label>
         <label className="field-label">转发方式<select value={props.form.redirect?.statusCode ?? "proxy"} onChange={(event) => props.onChange({ redirect: event.target.value === "proxy" ? null : { statusCode: Number(event.target.value) as 301 | 302, location: props.form.redirect?.location ?? props.form.upstreamUrl } })}><option value="proxy">反向代理</option><option value="301">301 永久跳转</option><option value="302">302 临时跳转</option></select></label>
         {props.form.redirect ? <label className="field-label">跳转地址<input type="url" value={props.form.redirect.location} onChange={(event) => props.onChange({ redirect: { ...props.form.redirect!, location: event.target.value } })} /></label> : <>
@@ -1336,7 +1337,7 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
         <section ref={profileDialogRef} className="site-editor" role="dialog" aria-modal="true" aria-label="编辑 API Profile">
           <div className="drawer-head"><div><p className="eyebrow">API Profile</p><h2>{profileDraft.id ? "编辑 Profile" : "新增 Profile"}</h2></div><button className="icon-button" onClick={() => { setProfileDraft(null); setProfileError(""); }} aria-label="关闭" title="关闭"><X size={16} /></button></div>
           <div className="site-editor-body">
-            <label className="field-label">名称<input value={profileDraft.name} onChange={(event) => setProfileDraft({ ...profileDraft, name: event.target.value })} autoFocus /></label>
+            <label className="field-label">名称<input value={profileDraft.name} onChange={(event) => setProfileDraft({ ...profileDraft, name: event.target.value })} /></label>
             <label className="field-label">Base URL<input value={profileDraft.baseUrl} onChange={(event) => setProfileDraft({ ...profileDraft, baseUrl: event.target.value })} /></label>
             <label className="field-label">模型<input value={profileDraft.model} onChange={(event) => setProfileDraft({ ...profileDraft, model: event.target.value })} /></label>
             <label className="field-label">API Key<input type="password" disabled={profileDraft.clearKey} value={profileDraft.apiKey} onChange={(event) => setProfileDraft({ ...profileDraft, apiKey: event.target.value })} placeholder="留空表示保持原值" autoComplete="new-password" /></label>

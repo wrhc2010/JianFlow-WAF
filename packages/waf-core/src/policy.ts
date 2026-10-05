@@ -12,6 +12,7 @@ export type SitePolicy = {
   aiBodyFields: string[];
   rateLimit: {
     enabled: boolean;
+    action?: "block" | "observe";
     requestsPerSecond: number;
     burst: number;
     maxConcurrent: number;
@@ -51,6 +52,6 @@ export function defaultPolicy(): SitePolicy {
     enforcement: "enforce", strength: "medium", customThreshold: 0.5, disabledRuleIds: [],
     aiBehavior: "enforce", aiScope: "suspicious", aiFailureAction: "inherit",
     aiIncompleteAction: "local", aiBodyFields: [],
-    rateLimit: { enabled: false, requestsPerSecond: 20, burst: 40, maxConcurrent: 50, blockSeconds: 10, paths: [] }
+    rateLimit: { enabled: false, action: "block", requestsPerSecond: 20, burst: 40, maxConcurrent: 50, blockSeconds: 10, paths: [] }
   };
 }

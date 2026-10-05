@@ -57,6 +57,30 @@ async function request(port: number): Promise<number> {
 }
 
 for (const database of ["sqlite", "postgres"] as const) {
+  test(`${database} persists independent global and site CC actions across restarts`, {
+    skip: database === "postgres" && !process.env.TEST_DATABASE_URL,
+  }, async (t) => {
+    const { store, open } = await fixture(t, database);
+    const global = defaultPolicy();
+    Object.assign(global.rateLimit, { enabled: true, action: "observe" });
+    await store.updateSettings({ defaultPolicy: global });
+    const inherited = await store.saveSite({ name: "Inherited CC", listenPort: 8081, upstreamUrl: "http://app:9000", mode: "traditional", enabled: true });
+    const legacy = defaultPolicy();
+    delete legacy.rateLimit.action;
+    const overridden = await store.saveSite({ name: "Independent CC", listenPort: 8082, upstreamUrl: "http://app:9000", mode: "traditional", enabled: true, policy: legacy });
+    const restarted = await open();
+    assert.equal(restarted.getSettings().defaultPolicy.rateLimit.action, "observe");
+    assert.equal(restarted.effectivePolicy(restarted.getSiteByPort(8081)!).rateLimit.action, "observe");
+    assert.equal(restarted.effectivePolicy(restarted.getSiteByPort(8082)!).rateLimit.action, "block");
+    const local = defaultPolicy(); local.rateLimit.action = "observe";
+    await restarted.saveSite({ ...overridden, policy: local });
+    await restarted.updateSettings({ defaultPolicy: defaultPolicy() });
+    const again = await open();
+    assert.equal(again.getSiteByPort(8081)?.id, inherited.id);
+    assert.equal(again.effectivePolicy(again.getSiteByPort(8081)!).rateLimit.action, "block");
+    assert.equal(again.effectivePolicy(again.getSiteByPort(8082)!).rateLimit.action, "observe");
+  });
+
   test(`${database} persists upstream pools, site audit modes and escalating ban history`, {
     skip: database === "postgres" && !process.env.TEST_DATABASE_URL,
   }, async (t) => {
