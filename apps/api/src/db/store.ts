@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { Pool, type QueryResultRow } from "pg";
 import {
   BUILTIN_RULES,
@@ -56,6 +57,8 @@ export type PageConfig = {
   html?: string;
   statusCode: number;
 };
+
+export type RuntimeBan = { siteId: string; ip: string; until: number; seconds: number; count: number };
 
 export type AiProfile = {
   id: string;
@@ -212,6 +215,7 @@ export class Store {
   private mutationQueue: Promise<unknown> = Promise.resolve();
   private builtinRuleIds = new Set<string>();
   private siteChangeListener: (() => void | Promise<void>) | undefined;
+  private readonly runtimeBans = new Map<string, RuntimeBan>();
 
   constructor() {
     this.pool = config.databaseUrl ? new Pool({ connectionString: config.databaseUrl }) : null;
@@ -511,6 +515,35 @@ export class Store {
       apiKeyConfigured: Boolean(config.openRouterKey),
       apiKeySource: this.settings.apiKeySource
     });
+  }
+
+  readPage(page: PageConfig | undefined): string | undefined {
+    if (!page || page.source !== "file" || !page.filePath) return page?.html;
+    try {
+      if (!existsSync(page.filePath)) return undefined;
+      const body = readFileSync(page.filePath);
+      if (body.length > 512 * 1024) return undefined;
+      return body.toString("utf8");
+    } catch { return undefined; }
+  }
+
+  getRuntimeBan(siteId: string, ip: string): RuntimeBan | undefined {
+    const ban = this.runtimeBans.get(`${siteId}\0${ip}`);
+    if (!ban || ban.until <= Date.now()) {
+      if (ban) this.runtimeBans.delete(`${siteId}\0${ip}`);
+      return undefined;
+    }
+    return { ...ban };
+  }
+
+  recordRuntimeBan(siteId: string, ip: string, baseSeconds: number, incrementSeconds: number, maxSeconds: number): RuntimeBan {
+    const key = `${siteId}\0${ip}`;
+    const previous = this.runtimeBans.get(key);
+    const count = (previous?.count ?? 0) + 1;
+    const seconds = Math.min(maxSeconds, baseSeconds + Math.max(0, count - 1) * incrementSeconds);
+    const ban = { siteId, ip, until: Date.now() + seconds * 1000, seconds, count };
+    this.runtimeBans.set(key, ban);
+    return { ...ban };
   }
 
   async updateSettings(next: SettingsUpdate): Promise<AppSettings> {

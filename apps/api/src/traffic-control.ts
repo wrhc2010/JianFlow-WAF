@@ -9,6 +9,21 @@ export class TrafficControl {
 
   snapshot() { return { concurrent: this.concurrent, trackedClients: this.buckets.size, maxTrackedClients: config.maxTrackedClients }; }
 
+  ban(siteId: string, ip: string, seconds: number, now = Date.now()): void {
+    if (!ip) return;
+    const key = `${siteId}\0${ip}`;
+    const current = this.buckets.get(key);
+    const bucket = current ?? { tokens: 0, updated: now, lastSeen: now, banUntil: 0, active: 0 };
+    bucket.lastSeen = now;
+    bucket.banUntil = Math.max(bucket.banUntil, now + Math.max(1, Math.ceil(seconds)) * 1000);
+    this.buckets.set(key, bucket);
+  }
+
+  isBanned(siteId: string, ip: string, now = Date.now()): number {
+    const until = this.buckets.get(`${siteId}\0${ip}`)?.banUntil ?? 0;
+    return until > now ? Math.max(1, Math.ceil((until - now) / 1000)) : 0;
+  }
+
   enter(siteId: string, ip: string, path: string, policy: SitePolicy, now = Date.now()): { allowed: boolean; reason?: string; retryAfter?: number; release: () => void } {
     const denied = (reason: string, seconds = 1) => ({ allowed: false, reason, retryAfter: seconds, release: () => {} });
     if (this.concurrent >= config.maxProxyConcurrent) return denied("global_concurrency");

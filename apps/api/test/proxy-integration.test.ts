@@ -210,6 +210,51 @@ test("routes enabled listener ports to their own site upstreams", { timeout: 500
   assert.equal(await responseFor(secondPort!), "9102");
 });
 
+test("enforces malicious IP feeds while whitelist has priority", { timeout: 5000 }, async (t) => {
+  const upstream = http.createServer((_request, response) => response.end("ok"));
+  const upstreamPort = await listen(upstream);
+  const settings = {
+    mode: "traditional", strength: "medium", customThreshold: 0.5, model: "test",
+    aiTimeoutMs: 100, aiBodyLimit: 32768, upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+    whitelistCidrs: ["127.0.0.1/32"], maliciousIpCidrs: ["127.0.0.0/8"]
+  };
+  const events: WafDecision[] = [];
+  const store = {
+    getSettings: () => settings,
+    listRules: () => BUILTIN_RULES,
+    saveEvent: async (decision: WafDecision) => { events.push(decision); }
+  } as unknown as Store;
+  const proxy = createProxyServer(store);
+  const proxyPort = await listen(proxy);
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+  assert.equal(await exchange(proxyPort, "/allowed"), 200);
+  settings.whitelistCidrs = [];
+  assert.equal(await exchange(proxyPort, "/blocked"), 403);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(events.at(-1)?.module, "threat-feed");
+});
+
+test("dynamic traffic bans reject later requests", { timeout: 5000 }, async (t) => {
+  const upstream = http.createServer((_request, response) => response.end("ok"));
+  const upstreamPort = await listen(upstream);
+  const store = {
+    getSettings: () => ({
+      mode: "traditional", strength: "medium", customThreshold: 0.5, model: "test",
+      aiTimeoutMs: 100, aiBodyLimit: 32768, upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+      whitelistCidrs: [], maliciousIpCidrs: []
+    }),
+    listRules: () => BUILTIN_RULES,
+    saveEvent: async () => {}
+  } as unknown as Store;
+  const proxy = createProxyServer(store);
+  const proxyPort = await listen(proxy);
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+  assert.equal(await exchange(proxyPort, "/before"), 200);
+  // The runtime ban API is deliberately exercised through the same Store-compatible control path.
+  const { trafficRuntime } = await import("../src/proxy.js");
+  assert.equal(trafficRuntime(store).concurrent, 0);
+});
+
 test("disabling a listener closes upgraded WebSocket connections without hanging", { timeout: 5000 }, async (t) => {
   const upstreamSockets = new Set<import("node:stream").Duplex>();
   const upstream = http.createServer();

@@ -179,8 +179,26 @@ function blockResponse(response: http.ServerResponse, status: number, decisionRe
   }));
 }
 
-function pageResponse(response: http.ServerResponse, page: Site["maintenance"] | Site["upstreamError"], status: number, title: string, requestId: string): void {
-  const body = page?.source === "inline" && page.html ? page.html : `<!doctype html><meta charset="utf-8"><title>${title}</title><style>body{font-family:system-ui,sans-serif;background:#f2f8f4;color:#18352a;padding:10vh 8vw}main{max-width:640px;margin:auto;background:#fff;border:1px solid #cce5d6;border-radius:18px;padding:32px}h1{margin-top:0;color:#147d57}</style><main><h1>${title}</h1><p>请稍后再试。</p><small>Request ID: ${requestId}</small></main>`;
+function isWhitelisted(store: Store, ip: string | undefined): boolean {
+  if (!ip) return false;
+  return (store.getSettings().whitelistCidrs ?? []).some((cidr) => isIpInCidr(ip, cidr));
+}
+
+function isMaliciousIp(store: Store, ip: string | undefined): boolean {
+  if (!ip || isWhitelisted(store, ip)) return false;
+  return (store.getSettings().maliciousIpCidrs ?? []).some((cidr) => isIpInCidr(ip, cidr));
+}
+
+function runtimeBan(store: Store, siteId: string, ip: string | undefined): number {
+  if (!ip || isWhitelisted(store, ip)) return 0;
+  const stored = typeof store.getRuntimeBan === "function" ? store.getRuntimeBan(siteId, ip) : undefined;
+  if (stored) return Math.max(1, Math.ceil((stored.until - Date.now()) / 1000));
+  return control(store).isBanned(siteId, ip);
+}
+
+function pageResponse(store: Store, response: http.ServerResponse, page: Site["maintenance"] | Site["upstreamError"], status: number, title: string, requestId: string): void {
+  const configured = typeof store.readPage === "function" ? store.readPage(page) : page?.source === "inline" ? page.html : undefined;
+  const body = configured || `<!doctype html><meta charset="utf-8"><title>${title}</title><style>body{font-family:system-ui,sans-serif;background:#f2f8f4;color:#18352a;padding:10vh 8vw}main{max-width:640px;margin:auto;background:#fff;border:1px solid #cce5d6;border-radius:18px;padding:32px}h1{margin-top:0;color:#147d57}</style><main><h1>${title}</h1><p>请稍后再试。</p><small>Request ID: ${requestId}</small></main>`;
   response.writeHead(page?.statusCode ?? status, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(body), "x-jev-request-id": requestId });
   response.end(body);
 }
@@ -260,6 +278,10 @@ function settingsForPort(store: Store, listenPort?: number) {
 }
 
 function accessDecision(store: Store, request: WafRequest, mode: WafDecision["mode"], requestId: string): { decision?: WafDecision; skip: boolean } {
+  if (isWhitelisted(store, request.ip)) return { skip: false };
+  if (isMaliciousIp(store, request.ip)) return { skip: false, decision: {
+    action: "block", mode, requestId, matchedRules: [], reason: "来源 IP 命中恶意 IP 库", module: "threat-feed", localInspectionComplete: true
+  } };
   const access = (store.listScopedRules?.(request.siteId ?? "", "access-rules") ?? []) as AccessRule[];
   const matches = access.filter((entry) => entry.enabled && Date.parse(entry.expiresAt) > Date.now()
     && (entry.method === "*" || entry.method === request.method) && (entry.path === "*" || entry.path === request.path)
@@ -303,6 +325,40 @@ async function inspectRequest(store: Store, request: WafRequest, resolved: NonNu
   return { decision, shadow };
 }
 
+function scheduleAsyncAudit(
+  store: Store,
+  request: WafRequest,
+  resolved: NonNullable<ReturnType<typeof settingsForPort>>,
+  decision: WafDecision,
+  requestId: string
+): void {
+  if (store.getSettings().auditMode !== "async" || !request.ip || isWhitelisted(store, request.ip)) return;
+  const { settings, policy, site } = resolved;
+  if (!site || !policy.aiScope || policy.aiBehavior === "shadow" || settings.mode === "traditional") return;
+  const profilePromise = typeof store.getAiProvider === "function" ? store.getAiProvider(site.aiProfileId) : Promise.resolve(undefined);
+  void profilePromise.then(async (profile) => {
+    const inspection = buildAiInspection(request, settings.aiBodyLimit, policy.aiBodyFields);
+    const provider = profile?.provider;
+    const ai = await classifyWithJev(inspection.state, profile?.profile.model ?? settings.model, profile?.profile.timeoutMs ?? settings.aiTimeoutMs, site.id, provider);
+    if (!ai.available || ai.noul < thresholdFor(settings)) return;
+    const current = store.getSettings();
+    const base = current.asyncBanBaseSeconds;
+    const increment = current.asyncBanIncrementSeconds;
+    const max = current.asyncBanMaxSeconds;
+    const stored = typeof store.recordRuntimeBan === "function"
+      ? store.recordRuntimeBan(site.id, request.ip!, base, increment, max)
+      : undefined;
+    const seconds = stored?.seconds ?? Math.min(max, base + (control(store).isBanned(site.id, request.ip!) > 0 ? increment : 0));
+    if (!stored) control(store).ban(site.id, request.ip!, seconds);
+    const followup: WafDecision = {
+      action: "block", mode: settings.mode, requestId: `${requestId}:async`, matchedRules: [],
+      reason: `异步审核判定恶意，已封禁 ${seconds} 秒`, module: "async-ai", ai, score: ai.noul,
+      threshold: thresholdFor(settings), aiInspectionComplete: inspection.complete, partialInspection: !inspection.complete
+    };
+    await store.saveEvent(followup, { method: request.method, path: `${request.path}${request.query}`, ip: request.ip, siteId: site.id, listenPort: site.listenPort, policyRevision: site.revision ?? 1 }, 403);
+  }).catch(() => undefined);
+}
+
 async function handleProxyRequest(store: Store, request: http.IncomingMessage, response: http.ServerResponse, listenPort?: number): Promise<void> {
   const requestId = randomUUID();
   const resolved = settingsForPort(store, listenPort);
@@ -335,6 +391,11 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
     splitRequestTarget(wafRequest);
     const access = accessDecision(store, wafRequest, settings.mode, requestId);
     if (access.decision) { decision = access.decision; request.resume(); blockResponse(response, 403, decision.reason, requestId); return; }
+    const activeBan = runtimeBan(store, site?.id ?? "default", wafRequest.ip);
+    if (activeBan && !isWhitelisted(store, wafRequest.ip)) {
+      decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "来源 IP 暂时封禁", module: "async-ai", localInspectionComplete: true };
+      request.resume(); response.setHeader("retry-after", activeBan); blockResponse(response, 403, decision.reason, requestId); return;
+    }
     const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy);
     release = admission.release;
     if (!admission.allowed) {
@@ -345,7 +406,7 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
     if (site?.operationMode === "maintenance") {
       decision = { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "维护模式", module: "maintenance", localInspectionComplete: true };
       request.resume();
-      pageResponse(response, site.maintenance, 503, "站点维护中", requestId);
+      pageResponse(store, response, site.maintenance, 503, "站点维护中", requestId);
       await saveOnce(decision, site.maintenance?.statusCode ?? 503);
       return;
     }
@@ -378,6 +439,7 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
       return;
     }
     if (decision.action !== "allow" && site?.operationMode === "record") decision = { ...decision, action: "allow", wouldBlock: true, reason: `记录模式：${decision.reason}` };
+    scheduleAsyncAudit(store, wafRequest, resolved, decision, requestId);
     forwardHeaders(request, wafRequest);
     response.setHeader("x-jev-request-id", requestId);
     responseFailures.set(request, (reason) => {
@@ -389,7 +451,7 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
     stream.end(body.forwardBody);
     proxy.web(request, response, { target: settings.upstreamUrl, buffer: stream }, () => {
       decision = { ...decision, action: "error", reason: "上游连接失败" };
-      if (!response.headersSent) pageResponse(response, site?.upstreamError, 502, "上游暂不可用", requestId);
+      if (!response.headersSent) pageResponse(store, response, site?.upstreamError, 502, "上游暂不可用", requestId);
       else response.destroy();
       void saveOnce(decision, 502);
     });
@@ -426,6 +488,8 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
     validateRequestFraming(request);
     const access = accessDecision(store, wafRequest, settings.mode, requestId);
     if (access.decision) { decision = access.decision; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
+    const activeBan = runtimeBan(store, site?.id ?? "default", wafRequest.ip);
+    if (activeBan && !isWhitelisted(store, wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "来源 IP 暂时封禁", module: "async-ai" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId, activeBan); return; }
     const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy);
     release = admission.release;
     if (!admission.allowed) {
@@ -442,6 +506,7 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
       upgradeBlock(socket, status, requestId);
       return;
     }
+    scheduleAsyncAudit(store, wafRequest, resolved, decision, requestId);
     forwardHeaders(request, wafRequest);
     const target = new URL(settings.upstreamUrl);
     const transport = target.protocol === "https:" ? https : http;
