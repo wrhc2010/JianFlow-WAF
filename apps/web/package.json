@@ -1,6 +1,6 @@
 {
   "name": "@jev-waf/web",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@jev-waf/core": "0.2.2",
+    "@jev-waf/core": "0.3.0",
     "@vitejs/plugin-react": "^4.3.4",
     "d3-geo": "^3.1.1",
     "lucide-react": "^0.468.0",

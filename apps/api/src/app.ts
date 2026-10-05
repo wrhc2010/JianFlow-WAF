@@ -24,6 +24,7 @@ import { policySchema, parsePolicy } from "./policy-validation.js";
 import { aiRuntime } from "./jev.js";
 import { trafficRuntime } from "./proxy.js";
 import type { SitePolicy, RuleException, AccessRule } from "@jev-waf/core";
+import type { Site, AiProfileInput } from "./db/store.js";
 
 function notFound(reply: FastifyReply, detail: string, instance: string) {
   return reply.code(404).type("application/problem+json").send({ type: "about:blank", title: "Not Found", status: 404, detail, instance });
@@ -288,6 +289,10 @@ export async function createApp(store: Store, logger = true) {
   );
 
   app.get("/api/v1/settings", async () => store.getSettings());
+  app.get("/api/v1/ai-profiles", async () => ({ data: await store.listAiProfiles() }));
+  app.post<{ Body: AiProfileInput }>("/api/v1/ai-profiles", async (request, reply) => reply.code(201).send(await store.saveAiProfile(request.body)));
+  app.patch<{ Params: { id: string }; Body: Omit<AiProfileInput, "id"> }>("/api/v1/ai-profiles/:id", async (request) => store.saveAiProfile({ ...request.body, id: request.params.id }));
+  app.delete<{ Params: { id: string } }>("/api/v1/ai-profiles/:id", async (request) => { await store.deleteAiProfile(request.params.id); return { ok: true }; });
   app.patch<{ Body: Record<string, unknown> }>(
     "/api/v1/settings",
     {
@@ -313,6 +318,14 @@ export async function createApp(store: Store, logger = true) {
               minimum: 1024,
               maximum: config.maxRequestBodyBytes,
             },
+            auditMode: { type: "string", enum: ["sync", "async"] },
+            asyncBanBaseSeconds: { type: "integer", minimum: 1, maximum: 86400 },
+            asyncBanIncrementSeconds: { type: "integer", minimum: 1, maximum: 86400 },
+            asyncBanMaxSeconds: { type: "integer", minimum: 1, maximum: 604800 },
+            whitelistCidrs: { type: "array", maxItems: 5000, items: { type: "string", maxLength: 64 } },
+            maliciousIpCidrs: { type: "array", maxItems: 5000, items: { type: "string", maxLength: 64 } },
+            waitRoomDefaults: { type: "object", additionalProperties: false, properties: { enabled: { type: "boolean" }, maxActive: { type: "integer", minimum: 1, maximum: 100000 }, maxQueue: { type: "integer", minimum: 0, maximum: 100000 }, timeoutSeconds: { type: "integer", minimum: 1, maximum: 86400 } } },
+            captcha: { type: "object", additionalProperties: false, properties: { enabled: { type: "boolean" }, provider: { type: "string", enum: ["local", "turnstile", "hcaptcha", "recaptcha"] }, siteKey: { type: "string", maxLength: 512 }, secret: { type: ["string", "null"], maxLength: 8192 } } },
           },
         },
       },
@@ -338,6 +351,17 @@ export async function createApp(store: Store, logger = true) {
         nextSettings.aiBodyLimit = Number(body.aiBodyLimit);
       if (body.upstreamUrl !== undefined)
         nextSettings.upstreamUrl = String(body.upstreamUrl);
+      if (body.auditMode !== undefined) nextSettings.auditMode = body.auditMode === "async" ? "async" : "sync";
+      for (const key of ["asyncBanBaseSeconds", "asyncBanIncrementSeconds", "asyncBanMaxSeconds"] as const) {
+        if (body[key] !== undefined) nextSettings[key] = Number(body[key]);
+      }
+      if (body.whitelistCidrs !== undefined) nextSettings.whitelistCidrs = body.whitelistCidrs as string[];
+      if (body.maliciousIpCidrs !== undefined) nextSettings.maliciousIpCidrs = body.maliciousIpCidrs as string[];
+      if (body.waitRoomDefaults !== undefined) nextSettings.waitRoomDefaults = body.waitRoomDefaults as NonNullable<Parameters<Store["updateSettings"]>[0]["waitRoomDefaults"]>;
+      if (body.captcha !== undefined) {
+        const captcha = body.captcha as Record<string, unknown>;
+        nextSettings.captcha = { ...store.getSettings().captcha, enabled: Boolean(captcha.enabled), provider: ["turnstile", "hcaptcha", "recaptcha"].includes(String(captcha.provider)) ? captcha.provider as "turnstile" | "hcaptcha" | "recaptcha" : "local", siteKey: typeof captcha.siteKey === "string" ? captcha.siteKey : "", ...(typeof captcha.secret === "string" ? { secretConfigured: captcha.secret.trim().length > 0 } : {}) };
+      }
       if (
         nextSettings.customThreshold !== undefined &&
         (!Number.isFinite(nextSettings.customThreshold) ||
@@ -395,8 +419,13 @@ export async function createApp(store: Store, logger = true) {
       listenPort?: number;
       upstreamUrl?: string;
       mode?: ProtectionMode;
+      operationMode?: "defense" | "record" | "maintenance";
+      aiProfileId?: string | null;
       enabled?: boolean;
       policy?: SitePolicy | null;
+      waitRoom?: { enabled: boolean; maxActive: number; maxQueue: number; timeoutSeconds: number };
+      maintenance?: { source: "default" | "file" | "inline"; filePath?: string; html?: string; statusCode: number };
+      upstreamError?: { source: "default" | "file" | "inline"; filePath?: string; html?: string; statusCode: number };
     };
   }>("/api/v1/sites", {
     schema: {
@@ -409,8 +438,13 @@ export async function createApp(store: Store, logger = true) {
           listenPort: { type: "integer", minimum: config.sitePortRange.min, maximum: config.sitePortRange.max },
           upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
           mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
-          enabled: { type: "boolean" }
-          ,policy: { anyOf: [policySchema, { type: "null" }] }
+          operationMode: { type: "string", enum: ["defense", "record", "maintenance"] },
+          aiProfileId: { type: ["string", "null"], maxLength: 128 },
+          enabled: { type: "boolean" },
+          policy: { anyOf: [policySchema, { type: "null" }] },
+          waitRoom: { type: "object", additionalProperties: false },
+          maintenance: { type: "object", additionalProperties: false },
+          upstreamError: { type: "object", additionalProperties: false }
         }
       }
     }
@@ -428,8 +462,13 @@ export async function createApp(store: Store, logger = true) {
       listenPort: body.listenPort,
       upstreamUrl: body.upstreamUrl,
       mode: body.mode ?? "hybrid",
+      operationMode: body.operationMode ?? "defense",
+      aiProfileId: body.aiProfileId ?? null,
       enabled: body.enabled ?? true,
       ...(body.policy === undefined ? {} : { policy: body.policy }),
+      ...(body.waitRoom === undefined ? {} : { waitRoom: body.waitRoom }),
+      ...(body.maintenance === undefined ? {} : { maintenance: body.maintenance }),
+      ...(body.upstreamError === undefined ? {} : { upstreamError: body.upstreamError }),
     });
     return reply.code(201).send(site);
   });
@@ -440,8 +479,13 @@ export async function createApp(store: Store, logger = true) {
       listenPort?: number;
       upstreamUrl?: string;
       mode?: ProtectionMode;
+      operationMode?: "defense" | "record" | "maintenance";
+      aiProfileId?: string | null;
       enabled?: boolean;
       policy?: SitePolicy | null;
+      waitRoom?: { enabled: boolean; maxActive: number; maxQueue: number; timeoutSeconds: number };
+      maintenance?: { source: "default" | "file" | "inline"; filePath?: string; html?: string; statusCode: number };
+      upstreamError?: { source: "default" | "file" | "inline"; filePath?: string; html?: string; statusCode: number };
     };
   }>("/api/v1/sites/:id", {
     schema: {
@@ -454,8 +498,13 @@ export async function createApp(store: Store, logger = true) {
           listenPort: { type: "integer", minimum: config.sitePortRange.min, maximum: config.sitePortRange.max },
           upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
           mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
-          enabled: { type: "boolean" }
-          ,policy: { anyOf: [policySchema, { type: "null" }] }
+          operationMode: { type: "string", enum: ["defense", "record", "maintenance"] },
+          aiProfileId: { type: ["string", "null"], maxLength: 128 },
+          enabled: { type: "boolean" },
+          policy: { anyOf: [policySchema, { type: "null" }] },
+          waitRoom: { type: "object", additionalProperties: false },
+          maintenance: { type: "object", additionalProperties: false },
+          upstreamError: { type: "object", additionalProperties: false }
         }
       }
     }

@@ -19,7 +19,7 @@
 
 ## 这版重点
 
-`v0.2.2` 增加了站点策略和误报调优，并修复 HTTPS 启停、AI 响应校验及出站脱敏问题：
+`v0.3.0` 是正式版架构升级：默认使用浅色青绿色工作台，支持深色模式、可收缩侧边栏、站点运行模式、等候室和多组 Jev Profile。生产环境建议使用 Nginx 做 TLS 和入口转发，Node WAF 继续负责规则、审核和安全决策。
 
 - 站点按监听端口区分入口，默认可用端口为 `8080-8099`，每个端口可以指向不同上游并使用不同防护模式。
 - “防护策略”和站点表单都采用草稿 + 保存/取消，避免输入过程中直接改动服务端配置。
@@ -35,6 +35,9 @@
 - 支持 JSON 和常见 ModSecurity `SecRule` 规则导入，提供预览、校验、冲突处理和原子写入。
 - WebUI 提供初始化、登录、规则库、Jev 配置、事件中心、2D 地图和 3D 攻击地球。
 - GeoIP 使用操作方提供的 MaxMind City/ASN MMDB 文件，不依赖在线 IP 查询。
+- 站点支持防御、记录、维护三种运行模式；维护页和上游错误页当前使用内置静态页面或受控的内联 HTML 配置。
+- 等候室按站点限制活动请求数、FIFO 排队数和等待超时，队列满或超时会返回明确的 `429`。
+- Jev/API Profile 支持不同的 Base URL、模型、超时和独立密钥；API 只返回是否已配置，不返回密钥明文。
 
 ## 看一眼
 
@@ -44,7 +47,7 @@
 
 ## 在 Linux 上部署
 
-以下步骤面向 Linux 服务器，命令使用 Bash，配置对应 `v0.2.2`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
+以下步骤面向 Linux 服务器，命令使用 Bash，配置对应 `v0.3.0`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
 
 需要 Git、curl、OpenSSL，以及已安装并运行的 Docker Engine 和 Docker Compose v2。使用容器部署不需要在宿主机安装 Node.js。
 
@@ -119,16 +122,35 @@ SITE_PORT_RANGE=8080-8109
 
 默认站点仍要求使用 `PROXY_PORT`，默认值是 `8080`；自定义范围应包含这个端口。
 
+### Nginx 生产入口
+
+推荐的生产链路是：
+
+```text
+客户端 -> Nginx(TLS/基础转发) -> JianFlow Node WAF(规则/审核/等候室) -> 上游
+```
+
+Nginx 不应直接把业务请求绕过 Node WAF。可以在 Nginx 中做 TLS 终止、基础代理头、连接超时和静态跳转；站点实际防护入口仍使用 JianFlow 分配的端口。当前仓库保留端口映射方式，导入 Nginx 配置前应先做预览和校验，不要直接执行用户上传的完整配置文件。
+
+### 高级配置格式
+
+- 页面配置：当前支持内置页面和受控的内联 HTML；WebUI 文件上传、挂载目录引用和完整的页面安全校验尚未接入，不能把任意 HTML 文件直接当作生产能力使用。
+- 白名单和恶意 IP：支持 CIDR 文本（一行一个）、JSON 数组、`{"ips":[...]}` 对象、CSV 第一列，以及 STIX Bundle 中的 IPv4/IPv6 Indicator。TAXII 地址需要先导出为 STIX Bundle 再导入，当前不直接联网拉取 TAXII。
+- GeoIP：支持 MaxMind `.mmdb`，包括 GeoLite/GeoIP City 和 ASN；请自行遵守 MaxMind 下载授权，并通过 `GEOIP_DIR` 只读挂载。
+- Nginx 解析器：仓库包含安全子集预览模块，覆盖 `server`、`listen`、`server_name`、`location`、`proxy_pass`、`return 301/302`、`upstream`、基础代理 Header 和 timeout；管理 API、确认导入、配置生成和 reload 尚未接入，不能据此绕过现有 Node WAF 入口。
+
+当前版本已验证的是 Profile 持久化/脱敏、站点运行模式、等候室、记录模式和上游错误页基础链路。异步追封、活动连接中断、验证码实际挑战与校验、白名单/恶意库运行时拦截、GeoIP 文件导入以及 Nginx 生产服务仍需后续版本完成端到端实现；配置字段存在不代表这些能力已经启用。
+
 ### 使用发布镜像
 
-不想在服务器构建时，可以从 [v0.2.2 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.2) 下载 API 和 Web 镜像压缩包。先按上面的步骤准备配置和密码文件，再导入镜像：
+不想在服务器构建时，可以从 [v0.3.0 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.3.0) 下载 API 和 Web 镜像压缩包。先按上面的步骤准备配置和密码文件，再导入镜像：
 
 ```bash
-sha256sum -c jianflow-waf-api-v0.2.2.tar.gz.sha256
-sha256sum -c jianflow-waf-web-v0.2.2.tar.gz.sha256
-docker load -i jianflow-waf-api-v0.2.2.tar.gz
-docker load -i jianflow-waf-web-v0.2.2.tar.gz
-IMAGE_TAG=v0.2.2 docker compose up -d --no-build --pull never
+sha256sum -c jianflow-waf-api-v0.3.0.tar.gz.sha256
+sha256sum -c jianflow-waf-web-v0.3.0.tar.gz.sha256
+docker load -i jianflow-waf-api-v0.3.0.tar.gz
+docker load -i jianflow-waf-web-v0.3.0.tar.gz
+IMAGE_TAG=v0.3.0 docker compose up -d --no-build --pull never
 ```
 
 `--pull never` 不会下载缺失的镜像；如果本机还没有 PostgreSQL 镜像，先运行 `docker pull postgres:16-alpine`。

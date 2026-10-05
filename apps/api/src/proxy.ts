@@ -14,6 +14,7 @@ import { classifyWithJev, aiRuntime } from "./jev.js";
 import { Store, type Site } from "./db/store.js";
 import { inspectBody } from "./body-inspection.js";
 import { TrafficControl } from "./traffic-control.js";
+import { WaitRoom } from "./wait-room.js";
 export { isIpInCidr } from "@jev-waf/core";
 
 const proxy = httpProxy.createProxyServer({ changeOrigin: true, xfwd: false, proxyTimeout: 30000 });
@@ -47,11 +48,24 @@ const clientControlledRoutingHeaders = [
   "x-http-method-override"
 ];
 const controls = new WeakMap<Store, TrafficControl>();
+const waitRooms = new WeakMap<Store, Map<string, WaitRoom>>();
 const builtinIds = new Set(BUILTIN_RULES.map((rule) => rule.id));
 function control(store: Store): TrafficControl {
   let value = controls.get(store);
   if (!value) { value = new TrafficControl(); controls.set(store, value); }
   return value;
+}
+function waitRoom(store: Store, site: Site): WaitRoom {
+  let rooms = waitRooms.get(store);
+  if (!rooms) { rooms = new Map(); waitRooms.set(store, rooms); }
+  const key = `${site.id}:${JSON.stringify(site.waitRoom)}`;
+  let room = rooms.get(key);
+  if (!room) {
+    room = new WaitRoom(site.waitRoom ?? { enabled: false, maxActive: 100, maxQueue: 100, timeoutSeconds: 60 });
+    rooms.set(key, room);
+    for (const old of rooms.keys()) if (old.startsWith(`${site.id}:`) && old !== key) rooms.delete(old);
+  }
+  return room;
 }
 export function trafficRuntime(store: Store) { return control(store).snapshot(); }
 
@@ -165,6 +179,12 @@ function blockResponse(response: http.ServerResponse, status: number, decisionRe
   }));
 }
 
+function pageResponse(response: http.ServerResponse, page: Site["maintenance"] | Site["upstreamError"], status: number, title: string, requestId: string): void {
+  const body = page?.source === "inline" && page.html ? page.html : `<!doctype html><meta charset="utf-8"><title>${title}</title><style>body{font-family:system-ui,sans-serif;background:#f2f8f4;color:#18352a;padding:10vh 8vw}main{max-width:640px;margin:auto;background:#fff;border:1px solid #cce5d6;border-radius:18px;padding:32px}h1{margin-top:0;color:#147d57}</style><main><h1>${title}</h1><p>请稍后再试。</p><small>Request ID: ${requestId}</small></main>`;
+  response.writeHead(page?.statusCode ?? status, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(body), "x-jev-request-id": requestId });
+  response.end(body);
+}
+
 function inspectionFailure(
   mode: WafDecision["mode"],
   requestId: string,
@@ -256,22 +276,30 @@ async function inspectRequest(store: Store, request: WafRequest, resolved: NonNu
   const { settings, policy, site } = resolved;
   if (skip) return { decision: { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "访问控制：跳过检测", module: "acl", localInspectionComplete: false } as WafDecision };
   const exceptions = (store.listScopedRules?.(site?.id ?? "", "exceptions") ?? []) as RuleException[];
-  const classify = (state: string, model: string, timeout: number) => classifyWithJev(state, model, timeout, site?.id);
-  if (policy.aiBehavior !== "shadow" || settings.mode === "traditional") return {
-    decision: await evaluateRequest(request, store.listRules(), settings, requestId, classify, { policy, exceptions })
+  const profile = typeof store.getAiProvider === "function" ? await store.getAiProvider(site?.aiProfileId) : undefined;
+  const effectiveSettings = profile ? { ...settings, model: profile.profile.model, aiTimeoutMs: profile.profile.timeoutMs } : settings;
+  const classify = (state: string, model: string, timeout: number) => classifyWithJev(
+    state,
+    profile?.profile.model ?? model,
+    profile?.profile.timeoutMs ?? timeout,
+    site?.id,
+    profile?.provider
+  );
+  if (policy.aiBehavior !== "shadow" || effectiveSettings.mode === "traditional") return {
+    decision: await evaluateRequest(request, store.listRules(), effectiveSettings, requestId, classify, { policy, exceptions })
   };
-  const decision = await evaluateRequest(request, store.listRules(), { ...settings, mode: "traditional" }, requestId, classify, { policy, exceptions });
-  decision.mode = settings.mode;
+  const decision = await evaluateRequest(request, store.listRules(), { ...effectiveSettings, mode: "traditional" }, requestId, classify, { policy, exceptions });
+  decision.mode = effectiveSettings.mode;
   if (decision.action !== "allow" || policy.aiScope === "suspicious" && !decision.matchedRules.length) return { decision };
-  const inspection = buildAiInspection(request, settings.aiBodyLimit, policy.aiBodyFields);
+  const inspection = buildAiInspection(request, effectiveSettings.aiBodyLimit, policy.aiBodyFields);
   // Shadow work has no waiting queue; admission and provider timeout bound its lifetime.
   const shadow = aiRuntime().active >= config.aiMaxConcurrent
     ? Promise.resolve({ aiInspectionComplete: false, aiOmittedReason: "concurrency_limit" } as Partial<WafDecision>)
-    : classify(inspection.state, settings.model, settings.aiTimeoutMs).then((ai): Partial<WafDecision> => ({ ai,
-      ...(ai.available ? { score: ai.noul } : {}), threshold: thresholdFor(settings),
+    : profile ? classify(inspection.state, profile.profile.model, profile.profile.timeoutMs).then((ai): Partial<WafDecision> => ({ ai,
+      ...(ai.available ? { score: ai.noul } : {}), threshold: thresholdFor(effectiveSettings),
       aiInspectionComplete: inspection.complete, ...(inspection.omittedReason ? { aiOmittedReason: inspection.omittedReason } : {}),
       partialInspection: !inspection.complete, module: "rules+ai-shadow"
-    }));
+    })) : Promise.resolve({ aiInspectionComplete: false, aiOmittedReason: "missing_profile" } as Partial<WafDecision>);
   return { decision, shadow };
 }
 
@@ -314,6 +342,22 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
       request.resume(); response.setHeader("retry-after", admission.retryAfter ?? 1);
       blockResponse(response, 429, decision.reason, requestId); return;
     }
+    if (site?.operationMode === "maintenance") {
+      decision = { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "维护模式", module: "maintenance", localInspectionComplete: true };
+      request.resume();
+      pageResponse(response, site.maintenance, 503, "站点维护中", requestId);
+      await saveOnce(decision, site.maintenance?.statusCode ?? 503);
+      return;
+    }
+    const roomAdmission = site ? await waitRoom(store, site).enter() : { allowed: true, queued: false, release: () => {} };
+    if (!roomAdmission.allowed) {
+      decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: roomAdmission.reason ?? "等候室拒绝", module: "wait-room", localInspectionComplete: false };
+      request.resume(); response.setHeader("retry-after", roomAdmission.retryAfter ?? 1);
+      blockResponse(response, 429, decision.reason, requestId); return;
+    }
+    const roomRelease = roomAdmission.release;
+    const previousRelease = release;
+    release = () => { previousRelease(); roomRelease(); };
     const body = await readBody(request);
     request.setTimeout(0);
     if (response.destroyed) return;
@@ -327,12 +371,13 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
     }
     decision.partialInspection = body.partial || Boolean(decision.partialInspection);
     if (response.destroyed) return;
-    if (decision.action !== "allow") {
+    if (decision.action !== "allow" && site?.operationMode !== "record") {
       const status = decision.action === "block" ? 403 : body.error ? body.error.includes("超过") ? 413 : 400 : decision.partialInspection ? 413 : 503;
       blockResponse(response, status, decision.reason, requestId);
       await saveOnce(decision, status);
       return;
     }
+    if (decision.action !== "allow" && site?.operationMode === "record") decision = { ...decision, action: "allow", wouldBlock: true, reason: `记录模式：${decision.reason}` };
     forwardHeaders(request, wafRequest);
     response.setHeader("x-jev-request-id", requestId);
     responseFailures.set(request, (reason) => {
@@ -344,7 +389,7 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
     stream.end(body.forwardBody);
     proxy.web(request, response, { target: settings.upstreamUrl, buffer: stream }, () => {
       decision = { ...decision, action: "error", reason: "上游连接失败" };
-      if (!response.headersSent) blockResponse(response, 502, decision.reason, requestId);
+      if (!response.headersSent) pageResponse(response, site?.upstreamError, 502, "上游暂不可用", requestId);
       else response.destroy();
       void saveOnce(decision, 502);
     });

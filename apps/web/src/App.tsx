@@ -53,7 +53,17 @@ type Settings = {
   apiKeyConfigured: boolean;
   apiKeySource: "environment" | "database" | "none";
   defaultPolicy: SitePolicy;
+  auditMode: "sync" | "async";
+  asyncBanBaseSeconds: number;
+  asyncBanIncrementSeconds: number;
+  asyncBanMaxSeconds: number;
+  whitelistCidrs: string[];
+  maliciousIpCidrs: string[];
+  waitRoomDefaults: { enabled: boolean; maxActive: number; maxQueue: number; timeoutSeconds: number };
+  captcha: { enabled: boolean; provider: "local" | "turnstile" | "hcaptcha" | "recaptcha"; siteKey: string; secretConfigured: boolean };
 };
+
+type AiProfile = { id: string; name: string; baseUrl: string; model: string; enabled: boolean; priority: number; timeoutMs: number; apiKeyConfigured: boolean };
 
 type Site = {
   id: string;
@@ -64,11 +74,16 @@ type Site = {
   enabled: boolean;
   createdAt: string;
   policy?: SitePolicy | null;
+  operationMode?: "defense" | "record" | "maintenance";
+  aiProfileId?: string | null;
+  waitRoom?: { enabled: boolean; maxActive: number; maxQueue: number; timeoutSeconds: number };
+  maintenance?: { source: "default" | "file" | "inline"; html?: string; statusCode: number };
+  upstreamError?: { source: "default" | "file" | "inline"; html?: string; statusCode: number };
   revision?: number;
   runtime?: { state: "pending" | "active" | "disabled" | "error"; desiredRevision: number; appliedRevision: number; lastError?: string };
 };
 
-type SiteDraft = Pick<Site, "name" | "listenPort" | "upstreamUrl" | "mode" | "enabled" | "policy">;
+type SiteDraft = Pick<Site, "name" | "listenPort" | "upstreamUrl" | "mode" | "enabled" | "policy" | "operationMode" | "aiProfileId" | "waitRoom" | "maintenance" | "upstreamError">;
 
 type Rule = {
   id: string;
@@ -165,7 +180,11 @@ const defaultSettings: Settings = {
   aiBodyLimit: 32768,
   upstreamUrl: "http://127.0.0.1:9000",
   apiKeyConfigured: false,
-  apiKeySource: "none", defaultPolicy: initialPolicy
+  apiKeySource: "none", defaultPolicy: initialPolicy,
+  auditMode: "sync", asyncBanBaseSeconds: 60, asyncBanIncrementSeconds: 60, asyncBanMaxSeconds: 86400,
+  whitelistCidrs: [], maliciousIpCidrs: [],
+  waitRoomDefaults: { enabled: false, maxActive: 100, maxQueue: 100, timeoutSeconds: 60 },
+  captcha: { enabled: false, provider: "local", siteKey: "", secretConfigured: false }
 };
 
 const defaultSystem: SystemStatus = {
@@ -344,7 +363,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
   const [section, setSection] = useState("overview");
   const [dirtySections, setDirtySections] = useState<Record<string, boolean>>({});
   const [runtime, setRuntime] = useState<{ ready: boolean; apiPort: number; active: number } | null>(null);
-  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem("jianflow-theme") as Theme | null) ?? "dark");
+  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem("jianflow-theme") as Theme | null) ?? "light");
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -383,7 +402,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
   }, []);
   return (
     <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
-      <aside className="sidebar">
+      <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
         <div className="sidebar-top"><div className="brand-glyph">J</div>{!collapsed && <div className="brand-copy"><strong>鉴流 · JianFlow</strong><span>防护控制台</span></div>}</div>
         <nav className="nav-list">
           {nav.map((item) => {
@@ -399,7 +418,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
       </aside>
       <main className="main-area">
         <header className="topbar">
-          <button className="icon-button" onClick={() => setCollapsed(!collapsed)} aria-label="折叠导航"><PanelLeft size={17} /></button>
+          <button className="icon-button" onClick={() => setCollapsed(!collapsed)} aria-label={collapsed ? "展开导航" : "折叠导航"} title={collapsed ? "展开导航" : "折叠导航"}><PanelLeft size={17} /></button>
           <div className="breadcrumb"><span>JianFlow WAF</span><ArrowRight size={13} /><strong>{navLabel(section)}</strong></div>
           <div className="topbar-right"><span className="live-pill"><span className={`status-dot ${runtime?.ready ? "" : "amber"}`} />{runtime ? `${runtime.active} 个运行入口` : "状态不可用"}</span><span className="topbar-time">{new Date().toLocaleDateString("zh-CN")}</span></div>
         </header>
@@ -425,6 +444,7 @@ function useConsoleData() {
   const [summary, setSummary] = useState<Record<string, number>>({});
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
+  const [profiles, setProfiles] = useState<AiProfile[]>([]);
   const [mapData, setMapData] = useState<MapData>({ points: [], countries: [], attackers: [], blocked: 0 });
   const [timeseries, setTimeseries] = useState<TimeSeriesPoint[]>([]);
   const [system, setSystem] = useState<SystemStatus>(defaultSystem);
@@ -810,20 +830,24 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(true);
   const [rules, setRules] = useState<Rule[]>([]);
+  const [profiles, setProfiles] = useState<AiProfile[]>([]);
 
   const load = async () => {
     setLoading(true);
     setError("");
     try {
-      const [siteResult, nextSettings, nextSystem, ruleResult] = await Promise.all([
+      const [siteResult, nextSettings, nextSystem, ruleResult, profileResult] = await Promise.all([
         api<{ data: Site[] }>("/api/v1/sites"),
         api<Settings>("/api/v1/settings"),
-        api<SystemStatus>("/api/v1/system"), api<{ data: Rule[] }>("/api/v1/rules")
+        api<SystemStatus>("/api/v1/system"),
+        api<{ data: Rule[] }>("/api/v1/rules"),
+        api<{ data: AiProfile[] }>("/api/v1/ai-profiles")
       ]);
       setSites(siteResult.data);
       setSettings(nextSettings);
       setSystem(nextSystem);
       setRules(ruleResult.data);
+      setProfiles(profileResult.data);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "站点加载失败");
     } finally {
@@ -859,7 +883,8 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
       listenPort: port,
       upstreamUrl: settings.upstreamUrl,
       mode: settings.apiKeyConfigured ? settings.mode : "traditional",
-      enabled: true, policy: null
+      enabled: true, policy: null, operationMode: "defense", aiProfileId: profiles[0]?.id ?? null,
+      waitRoom: structuredClone(settings.waitRoomDefaults), maintenance: { source: "default", statusCode: 503 }, upstreamError: { source: "default", statusCode: 502 }
     };
     setEditingId(null);
     setForm(next);
@@ -873,7 +898,8 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
       listenPort: site.listenPort,
       upstreamUrl: site.upstreamUrl,
       mode: settings.apiKeyConfigured ? site.mode : "traditional",
-      enabled: site.enabled, policy: site.policy ?? null
+      enabled: site.enabled, policy: site.policy ?? null, operationMode: site.operationMode ?? "defense", aiProfileId: site.aiProfileId ?? null,
+      waitRoom: site.waitRoom ?? structuredClone(settings.waitRoomDefaults), maintenance: site.maintenance ?? { source: "default", statusCode: 503 }, upstreamError: site.upstreamError ?? { source: "default", statusCode: 502 }
     };
     setEditingId(site.id);
     setForm(next);
@@ -986,6 +1012,7 @@ function Sites({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
         globalPolicy={settings.defaultPolicy}
         rules={rules}
         onScopedDirtyChange={setScopedDirty}
+        profiles={profiles}
         ports={editingId === "default" ? [system.proxyPort] : availablePorts(form.listenPort)}
         onChange={(patch) => setForm((current) => current ? { ...current, ...patch } : current)}
         onSave={() => void save()}
@@ -1007,6 +1034,7 @@ function SiteEditor(props: {
   status: string;
   globalPolicy: SitePolicy;
   rules: Rule[];
+  profiles: AiProfile[];
   onScopedDirtyChange: (dirty: boolean) => void;
 }) {
   const [tab, setTab] = useState("入口");
@@ -1034,6 +1062,10 @@ function SiteEditor(props: {
         <label className="field-label">入口端口<select value={props.form.listenPort} onChange={(event) => props.onChange({ listenPort: Number(event.target.value) })}>{props.ports.map((port) => <option key={port} value={port}>:{port}</option>)}</select></label>
         <label className="field-label">上游地址<input value={props.form.upstreamUrl} onChange={(event) => props.onChange({ upstreamUrl: event.target.value })} placeholder="http://app:9000" /></label>
         <label className="field-label">防护模式<select value={props.form.mode} onChange={(event) => props.onChange({ mode: event.target.value as Mode })}><option value="traditional">传统规则</option><option value="hybrid" disabled={!props.hasJevKey}>混合模式{!props.hasJevKey ? "（需配置 Jev key）" : ""}</option><option value="ai" disabled={!props.hasJevKey}>AI 判断{!props.hasJevKey ? "（需配置 Jev key）" : ""}</option></select></label>
+        <label className="field-label">运行模式<select value={props.form.operationMode ?? "defense"} onChange={(event) => props.onChange({ operationMode: event.target.value as "defense" | "record" | "maintenance" })}><option value="defense">防御模式</option><option value="record">记录模式</option><option value="maintenance">维护模式</option></select></label>
+        <label className="field-label">API Profile<select value={props.form.aiProfileId ?? ""} onChange={(event) => props.onChange({ aiProfileId: event.target.value || null })}><option value="">自动选择</option>{props.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={!profile.apiKeyConfigured || !profile.enabled}>{profile.name}{profile.apiKeyConfigured ? "" : "（无 Key）"}</option>)}</select></label>
+        <label className="check-label"><input type="checkbox" checked={props.form.waitRoom?.enabled ?? false} onChange={(event) => props.onChange({ waitRoom: { ...(props.form.waitRoom ?? { maxActive: 100, maxQueue: 100, timeoutSeconds: 60 }), enabled: event.target.checked } })} />启用等候室</label>
+        <div className="form-grid compact-grid"><label className="field-label">活动上限<input type="number" value={props.form.waitRoom?.maxActive ?? 100} onChange={(event) => props.onChange({ waitRoom: { ...(props.form.waitRoom ?? { enabled: false, maxActive: 100, maxQueue: 100, timeoutSeconds: 60 }), maxActive: Number(event.target.value) } })} /></label><label className="field-label">队列上限<input type="number" value={props.form.waitRoom?.maxQueue ?? 100} onChange={(event) => props.onChange({ waitRoom: { ...(props.form.waitRoom ?? { enabled: false, maxActive: 100, maxQueue: 100, timeoutSeconds: 60 }), maxQueue: Number(event.target.value) } })} /></label><label className="field-label">等待超时<input type="number" value={props.form.waitRoom?.timeoutSeconds ?? 60} onChange={(event) => props.onChange({ waitRoom: { ...(props.form.waitRoom ?? { enabled: false, maxActive: 100, maxQueue: 100, timeoutSeconds: 60 }), timeoutSeconds: Number(event.target.value) } })} /></label></div>
         <label className="check-label site-enabled"><input type="checkbox" checked={props.form.enabled} onChange={(event) => props.onChange({ enabled: event.target.checked })} />启用此入口</label>
         {!props.hasJevKey && <div className="inline-status">未配置 Jev key，AI 和混合模式不可用，保存时会使用传统规则。</div>}
         </>}
@@ -1058,13 +1090,16 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
   const [jevStatus, setJevStatus] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [profiles, setProfiles] = useState<AiProfile[]>([]);
+  const [profileDraft, setProfileDraft] = useState<{ id?: string; name: string; baseUrl: string; model: string; apiKey: string; enabled: boolean; priority: number; timeoutMs: number } | null>(null);
 
   const load = async () => {
     setLoading(true);
     setError("");
     try {
-      const [next, ruleResult] = await Promise.all([api<Settings>("/api/v1/settings"), api<{ data: Rule[] }>("/api/v1/rules")]);
+      const [next, ruleResult, profileResult] = await Promise.all([api<Settings>("/api/v1/settings"), api<{ data: Rule[] }>("/api/v1/rules"), api<{ data: AiProfile[] }>("/api/v1/ai-profiles")]);
       setRules(ruleResult.data);
+      setProfiles(profileResult.data);
       setServerSettings(next);
       setDraft(next);
       setApiKey("");
@@ -1126,6 +1161,13 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
       setJevStatus(failure instanceof Error ? failure.message : "策略保存失败");
     }
   };
+  const saveProfile = async () => {
+    if (!profileDraft) return;
+    const payload = { name: profileDraft.name, baseUrl: profileDraft.baseUrl, model: profileDraft.model, enabled: profileDraft.enabled, priority: profileDraft.priority, timeoutMs: profileDraft.timeoutMs, ...(profileDraft.apiKey ? { apiKey: profileDraft.apiKey } : {}) };
+    const saved = await api<AiProfile>(profileDraft.id ? `/api/v1/ai-profiles/${profileDraft.id}` : "/api/v1/ai-profiles", { method: profileDraft.id ? "PATCH" : "POST", body: JSON.stringify(payload) });
+    setProfiles((current) => profileDraft.id ? current.map((entry) => entry.id === saved.id ? saved : entry) : [...current, saved]);
+    setProfileDraft(null);
+  };
   const modeOptions: Array<[Mode, string, string, typeof Network]> = [
     ["hybrid", "混合模式", "先规则过滤，再由 Jev 复核", Network],
     ["ai", "AI 判断", "由 Jev 判断请求风险分数", Bot],
@@ -1173,6 +1215,23 @@ function SettingsPanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => v
         </Panel>
       </div>
       <div className="two-column settings-layout global-policy-layout"><Panel title="全局默认防护"><PolicyFields policy={draft.defaultPolicy} rules={rules} onChange={(policy) => updateDraft({ defaultPolicy: policy, strength: policy.strength, customThreshold: policy.customThreshold })} /></Panel><Panel title="全局默认限速"><PolicyFields policy={draft.defaultPolicy} rateOnly onChange={(policy) => updateDraft({ defaultPolicy: policy })} /></Panel></div>
+      <div className="two-column settings-layout">
+        <Panel title="Jev / API Profiles" action={<button className="secondary-button" onClick={() => setProfileDraft({ name: "", baseUrl: draft.jevBaseUrl, model: draft.model, apiKey: "", enabled: true, priority: 100, timeoutMs: draft.aiTimeoutMs })}><Plus size={14} />新增 Profile</button>}>
+          <div className="profile-list">{profiles.length ? profiles.map((profile) => <div className="profile-row" key={profile.id}><div><strong>{profile.name}</strong><span>{profile.model} · {profile.baseUrl}</span></div><span className={`status-badge ${profile.apiKeyConfigured && profile.enabled ? "green" : "amber"}`}>{profile.apiKeyConfigured ? "已配置" : "无 Key"}</span><button className="icon-button" title="编辑 Profile" aria-label="编辑 Profile" onClick={() => setProfileDraft({ id: profile.id, name: profile.name, baseUrl: profile.baseUrl, model: profile.model, apiKey: "", enabled: profile.enabled, priority: profile.priority, timeoutMs: profile.timeoutMs })}><Edit3 size={14} /></button>{profile.id !== "default" && <button className="icon-button danger-button" title="删除 Profile" aria-label="删除 Profile" onClick={async () => { await api(`/api/v1/ai-profiles/${profile.id}`, { method: "DELETE" }); setProfiles((current) => current.filter((entry) => entry.id !== profile.id)); }}><Trash2 size={14} /></button>}</div>) : <div className="empty-state">暂无可用 Profile</div>}</div>
+          <p className="panel-meta">Key 仅在服务端加密保存；站点可在编辑器中选择 Profile。</p>
+        </Panel>
+        <Panel title="审核与等候室">
+          <label className="field-label">审核模式<select value={draft.auditMode} onChange={(event) => updateDraft({ auditMode: event.target.value as Settings["auditMode"] })}><option value="sync">同步审核</option><option value="async">异步审核</option></select></label>
+          <div className="form-grid compact-grid"><label className="field-label">异步基础封禁（秒）<input type="number" value={draft.asyncBanBaseSeconds} onChange={(event) => updateDraft({ asyncBanBaseSeconds: Number(event.target.value) })} /></label><label className="field-label">递增（秒）<input type="number" value={draft.asyncBanIncrementSeconds} onChange={(event) => updateDraft({ asyncBanIncrementSeconds: Number(event.target.value) })} /></label><label className="field-label">最大封禁（秒）<input type="number" value={draft.asyncBanMaxSeconds} onChange={(event) => updateDraft({ asyncBanMaxSeconds: Number(event.target.value) })} /></label></div>
+          <label className="check-label"><input type="checkbox" checked={draft.waitRoomDefaults.enabled} onChange={(event) => updateDraft({ waitRoomDefaults: { ...draft.waitRoomDefaults, enabled: event.target.checked } })} />启用默认等候室</label>
+          <div className="form-grid compact-grid"><label className="field-label">活动请求上限<input type="number" value={draft.waitRoomDefaults.maxActive} onChange={(event) => updateDraft({ waitRoomDefaults: { ...draft.waitRoomDefaults, maxActive: Number(event.target.value) } })} /></label><label className="field-label">队列上限<input type="number" value={draft.waitRoomDefaults.maxQueue} onChange={(event) => updateDraft({ waitRoomDefaults: { ...draft.waitRoomDefaults, maxQueue: Number(event.target.value) } })} /></label><label className="field-label">等待超时（秒）<input type="number" value={draft.waitRoomDefaults.timeoutSeconds} onChange={(event) => updateDraft({ waitRoomDefaults: { ...draft.waitRoomDefaults, timeoutSeconds: Number(event.target.value) } })} /></label></div>
+        </Panel>
+      </div>
+      <div className="two-column settings-layout">
+        <Panel title="IP 白名单与恶意库"><label className="field-label">白名单 CIDR（一行一个）<textarea rows={4} value={draft.whitelistCidrs.join("\n")} onChange={(event) => updateDraft({ whitelistCidrs: event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) })} /></label><label className="field-label">恶意 IP/CIDR（一行一个）<textarea rows={4} value={draft.maliciousIpCidrs.join("\n")} onChange={(event) => updateDraft({ maliciousIpCidrs: event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) })} /></label><p className="panel-meta">支持 IPv4、IPv6 和 CIDR。JSON、CSV、STIX Bundle 导入接口保留给批量导入流程。</p></Panel>
+        <Panel title="人机验证"><label className="check-label"><input type="checkbox" checked={draft.captcha.enabled} onChange={(event) => updateDraft({ captcha: { ...draft.captcha, enabled: event.target.checked } })} />启用人机验证</label><label className="field-label">供应商<select value={draft.captcha.provider} onChange={(event) => updateDraft({ captcha: { ...draft.captcha, provider: event.target.value as Settings["captcha"]["provider"] } })}><option value="local">本地挑战</option><option value="turnstile">Turnstile</option><option value="hcaptcha">hCaptcha</option><option value="recaptcha">reCAPTCHA</option></select></label><label className="field-label">Site Key<input value={draft.captcha.siteKey} onChange={(event) => updateDraft({ captcha: { ...draft.captcha, siteKey: event.target.value } })} /></label><p className="panel-meta">Secret 当前只显示配置状态，不在接口回显。</p></Panel>
+      </div>
+      {profileDraft && <div className="modal-backdrop" role="presentation"><section className="site-editor" role="dialog" aria-modal="true" aria-label="编辑 API Profile"><div className="drawer-head"><div><p className="eyebrow">API Profile</p><h2>{profileDraft.id ? "编辑 Profile" : "新增 Profile"}</h2></div><button className="icon-button" onClick={() => setProfileDraft(null)} aria-label="关闭" title="关闭"><X size={16} /></button></div><div className="site-editor-body"><label className="field-label">名称<input value={profileDraft.name} onChange={(event) => setProfileDraft({ ...profileDraft, name: event.target.value })} autoFocus /></label><label className="field-label">Base URL<input value={profileDraft.baseUrl} onChange={(event) => setProfileDraft({ ...profileDraft, baseUrl: event.target.value })} /></label><label className="field-label">模型<input value={profileDraft.model} onChange={(event) => setProfileDraft({ ...profileDraft, model: event.target.value })} /></label><label className="field-label">API Key<input type="password" value={profileDraft.apiKey} onChange={(event) => setProfileDraft({ ...profileDraft, apiKey: event.target.value })} placeholder="留空表示保持原值" autoComplete="new-password" /></label><div className="form-grid compact-grid"><label className="field-label">优先级<input type="number" value={profileDraft.priority} onChange={(event) => setProfileDraft({ ...profileDraft, priority: Number(event.target.value) })} /></label><label className="field-label">超时（毫秒）<input type="number" value={profileDraft.timeoutMs} onChange={(event) => setProfileDraft({ ...profileDraft, timeoutMs: Number(event.target.value) })} /></label></div><label className="check-label"><input type="checkbox" checked={profileDraft.enabled} onChange={(event) => setProfileDraft({ ...profileDraft, enabled: event.target.checked })} />启用 Profile</label></div><div className="site-editor-actions"><button className="secondary-button" onClick={() => setProfileDraft(null)}>取消</button><button className="primary-button" onClick={() => void saveProfile()}><Save size={15} />保存 Profile</button></div></section></div>}
     </section>
   );
 }

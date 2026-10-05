@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AppSettings, EventRecord, EventFilters, TimeSeriesPoint, AttackMap } from "./store.js";
+import type { AppSettings, EventRecord, EventFilters, TimeSeriesPoint, AttackMap, PageConfig, WaitRoomConfig, AiProfile } from "./store.js";
 import type { WafRule } from "@jev-waf/core";
 import { SetupConflictError } from "../errors.js";
 import type { ProtectionMode, SitePolicy, RuleException, AccessRule } from "@jev-waf/core";
@@ -11,10 +11,11 @@ export type LocalState = {
   initialized: boolean;
   credential?: { salt: string; hash: string } | undefined;
   apiKeyCiphertext: string | null;
+  aiProfiles?: Array<AiProfile & { apiKeyCiphertext?: string | null }>;
   rules: WafRule[];
   builtinRuleIds?: string[] | undefined;
   scopedRules?: Array<RuleException | AccessRule>;
-  sites: Array<{ id: string; name: string; listenPort: number; upstreamUrl: string; mode: ProtectionMode; enabled: boolean; createdAt: string; policy?: SitePolicy | null; revision?: number }>;
+  sites: Array<{ id: string; name: string; listenPort: number; upstreamUrl: string; mode: ProtectionMode; enabled: boolean; createdAt: string; policy?: SitePolicy | null; revision?: number; operationMode?: "defense" | "record" | "maintenance"; aiProfileId?: string | null; waitRoom?: WaitRoomConfig; maintenance?: PageConfig; upstreamError?: PageConfig }>;
 };
 
 export class LocalDatabase {

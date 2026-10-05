@@ -35,7 +35,37 @@ export type Site = {
   createdAt: string;
   policy?: SitePolicy | null;
   revision?: number;
+  operationMode?: "defense" | "record" | "maintenance";
+  aiProfileId?: string | null;
+  waitRoom?: WaitRoomConfig;
+  maintenance?: PageConfig;
+  upstreamError?: PageConfig;
   runtime?: RuntimeStatus;
+};
+
+export type WaitRoomConfig = {
+  enabled: boolean;
+  maxActive: number;
+  maxQueue: number;
+  timeoutSeconds: number;
+};
+
+export type PageConfig = {
+  source: "default" | "file" | "inline";
+  filePath?: string;
+  html?: string;
+  statusCode: number;
+};
+
+export type AiProfile = {
+  id: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  enabled: boolean;
+  priority: number;
+  timeoutMs: number;
+  apiKeyConfigured: boolean;
 };
 
 export type EventRecord = {
@@ -77,6 +107,14 @@ export type AppSettings = EvaluationSettings & {
   apiKeyConfigured: boolean;
   apiKeySource: "environment" | "database" | "none";
   defaultPolicy: SitePolicy;
+  auditMode: "sync" | "async";
+  asyncBanBaseSeconds: number;
+  asyncBanIncrementSeconds: number;
+  asyncBanMaxSeconds: number;
+  whitelistCidrs: string[];
+  maliciousIpCidrs: string[];
+  waitRoomDefaults: WaitRoomConfig;
+  captcha: { enabled: boolean; provider: "local" | "turnstile" | "hcaptcha" | "recaptcha"; siteKey: string; secretConfigured: boolean };
 };
 
 export type EventFilters = {
@@ -102,6 +140,17 @@ type SettingsUpdate = Partial<Omit<AppSettings, "apiKeyConfigured" | "apiKeySour
   apiKey?: string | null;
 };
 
+export type AiProfileInput = {
+  id?: string;
+  name: string;
+  baseUrl: string;
+  model: string;
+  apiKey?: string | null;
+  enabled?: boolean;
+  priority?: number;
+  timeoutMs?: number;
+};
+
 function defaultSettings(): AppSettings {
   return {
   mode: config.defaultMode,
@@ -114,7 +163,15 @@ function defaultSettings(): AppSettings {
   jevBaseUrl: config.jevBaseUrl,
   apiKeyConfigured: Boolean(config.openRouterKey),
   apiKeySource: config.openRouterKey ? "environment" : "none"
-  ,defaultPolicy: { ...defaultPolicy(), strength: config.defaultStrength }
+  ,defaultPolicy: { ...defaultPolicy(), strength: config.defaultStrength },
+  auditMode: "sync",
+  asyncBanBaseSeconds: 60,
+  asyncBanIncrementSeconds: 60,
+  asyncBanMaxSeconds: 86400,
+  whitelistCidrs: [],
+  maliciousIpCidrs: [],
+  waitRoomDefaults: { enabled: false, maxActive: 100, maxQueue: 100, timeoutSeconds: 60 },
+  captcha: { enabled: false, provider: "local", siteKey: "", secretConfigured: false }
   };
 }
 
@@ -150,6 +207,7 @@ export class Store {
   private retentionWork: Promise<number> | undefined;
   private credential: { salt: string; hash: string } | undefined;
   private apiKeyCiphertext: string | null = null;
+  private aiProfiles = new Map<string, AiProfile & { apiKeyCiphertext?: string | null }>();
   private setupInProgress = false;
   private mutationQueue: Promise<unknown> = Promise.resolve();
   private builtinRuleIds = new Set<string>();
@@ -175,15 +233,18 @@ export class Store {
       const state = this.local!.readState();
       if (state) {
         this.settings = state.settings;
+        this.normalizeSettingsDefaults();
         this.settings.defaultPolicy ??= { ...defaultPolicy(), strength: this.settings.strength, customThreshold: this.settings.customThreshold };
         this.scopedRules = state.scopedRules ?? [];
         this.initialized = Boolean(state.initialized && state.credential);
         this.credential = state.credential;
         this.apiKeyCiphertext = state.apiKeyCiphertext;
+        this.aiProfiles.clear();
+        for (const profile of state.aiProfiles ?? []) this.aiProfiles.set(profile.id, profile);
         this.rules = state.rules;
         this.builtinRuleIds = new Set(state.builtinRuleIds ?? state.rules.map((rule) => rule.id));
         this.sites.clear();
-        for (const site of state.sites) this.sites.set(site.id, site);
+        for (const site of state.sites) this.sites.set(site.id, this.normalizeSite(site));
       } else if (this.initialized) {
         this.credential = makeAdminCredential(config.adminPassword);
       }
@@ -194,6 +255,9 @@ export class Store {
         this.builtinRuleIds.add(rule.id);
       }
       this.syncRuntimeSettings();
+      if (!this.aiProfiles.size && (this.settings.apiKeyConfigured || config.environmentApiKey)) {
+        this.aiProfiles.set("default", { id: "default", name: "默认 Jev", baseUrl: this.settings.jevBaseUrl, model: this.settings.model, enabled: true, priority: 100, timeoutMs: this.settings.aiTimeoutMs, apiKeyConfigured: Boolean(this.apiKeyCiphertext || config.environmentApiKey), apiKeyCiphertext: this.apiKeyCiphertext });
+      }
       const site = this.sites.get("default");
       if (site) {
         site.listenPort = config.proxyPort;
@@ -229,12 +293,15 @@ export class Store {
     const settingResult = await this.pool.query(
       `SELECT mode, strength, custom_threshold, model, jev_base_url,
               api_key_ciphertext, admin_password_salt, admin_password_hash,
-              initialized, ai_timeout_ms, ai_body_limit, upstream_url, default_policy
+              initialized, ai_timeout_ms, ai_body_limit, upstream_url, default_policy,
+              audit_mode, async_ban_base_seconds, async_ban_increment_seconds, async_ban_max_seconds,
+              whitelist_cidrs, malicious_ip_cidrs, wait_room_defaults, captcha
        FROM settings WHERE id = 1`
     );
     const row = settingResult.rows[0] as Record<string, unknown> | undefined;
     if (row) {
       this.settings = {
+        ...defaultSettings(),
         mode: row.mode as ProtectionMode,
         strength: row.strength as ProtectionStrength,
         customThreshold: Number(row.custom_threshold),
@@ -247,6 +314,14 @@ export class Store {
         apiKeySource: row.api_key_ciphertext ? "database" : config.environmentApiKey ? "environment" : "none",
         defaultPolicy: row.default_policy ? parsePolicy(row.default_policy) : { ...defaultPolicy(), strength: row.strength as ProtectionStrength, customThreshold: Number(row.custom_threshold) }
       };
+      this.settings.auditMode = row.audit_mode === "async" ? "async" : "sync";
+      this.settings.asyncBanBaseSeconds = Number(row.async_ban_base_seconds ?? 60);
+      this.settings.asyncBanIncrementSeconds = Number(row.async_ban_increment_seconds ?? 60);
+      this.settings.asyncBanMaxSeconds = Number(row.async_ban_max_seconds ?? 86400);
+      this.settings.whitelistCidrs = readStringArray(row.whitelist_cidrs);
+      this.settings.maliciousIpCidrs = readStringArray(row.malicious_ip_cidrs);
+      this.settings.waitRoomDefaults = parseWaitRoom(row.wait_room_defaults);
+      this.settings.captcha = parseCaptcha(row.captcha);
       this.initialized = Boolean(row.initialized);
       if (row.admin_password_salt && row.admin_password_hash) {
         this.credential = { salt: String(row.admin_password_salt), hash: String(row.admin_password_hash) };
@@ -257,6 +332,7 @@ export class Store {
       }
       this.apiKeyCiphertext = row.api_key_ciphertext ? String(row.api_key_ciphertext) : null;
     }
+    await this.ensureDefaultAiProfile();
     if (this.initialized && !row?.admin_password_hash && config.adminPassword) {
       this.credential = exportAdminCredential();
       await this.persistAdminCredential();
@@ -295,6 +371,79 @@ export class Store {
     const scoped = await this.pool.query("SELECT value FROM scoped_rules ORDER BY id");
     this.scopedRules = scoped.rows.map((entry) => entry.value as RuleException | AccessRule);
     this.startRetention();
+  }
+
+  async listAiProfiles(): Promise<AiProfile[]> {
+    if (!this.pool) return [...this.aiProfiles.values()].map(({ apiKeyCiphertext: _secret, ...profile }) => structuredClone(profile));
+    const result = await this.pool.query("SELECT id,name,base_url,model,enabled,priority,timeout_ms,api_key_ciphertext FROM ai_profiles ORDER BY priority ASC, name ASC");
+    return result.rows.map((row) => ({ id: String(row.id), name: String(row.name), baseUrl: String(row.base_url), model: String(row.model), enabled: Boolean(row.enabled), priority: Number(row.priority), timeoutMs: Number(row.timeout_ms), apiKeyConfigured: Boolean(row.api_key_ciphertext) }));
+  }
+
+  async getAiProvider(id?: string | null): Promise<{ profile: AiProfile; provider: { baseUrl: string; apiKey: string } } | undefined> {
+    const profiles = await this.listAiProfiles();
+    const selected = profiles.find((profile) => profile.id === (id ?? "default"))
+      ?? profiles.find((profile) => profile.enabled && profile.apiKeyConfigured)
+      ?? profiles.find((profile) => profile.enabled);
+    if (!selected || !selected.enabled) return undefined;
+    let apiKey = "";
+    if (selected.id === "default") {
+      apiKey = this.apiKeyCiphertext ? decryptSecret(this.apiKeyCiphertext, config.sessionSecret) : config.environmentApiKey;
+    } else if (this.pool) {
+      const result = await this.pool.query("SELECT api_key_ciphertext FROM ai_profiles WHERE id=$1", [selected.id]);
+      const ciphertext = result.rows[0]?.api_key_ciphertext ? String(result.rows[0].api_key_ciphertext) : "";
+      apiKey = ciphertext ? decryptSecret(ciphertext, config.sessionSecret) : "";
+    } else {
+      const profile = this.aiProfiles.get(selected.id);
+      apiKey = profile?.apiKeyCiphertext ? decryptSecret(profile.apiKeyCiphertext, config.sessionSecret) : "";
+      if (!apiKey && selected.id === "default") apiKey = config.environmentApiKey;
+    }
+    if (!apiKey) return undefined;
+    return { profile: selected, provider: { baseUrl: selected.baseUrl, apiKey } };
+  }
+
+  async saveAiProfile(input: AiProfileInput): Promise<AiProfile> {
+    const id = input.id?.trim() || randomUUID();
+    if (!input.name.trim() || input.name.length > 128) throw new ValidationError("Profile 名称无效");
+    const baseUrl = normalizeBaseUrl(input.baseUrl);
+    validateHttpEndpoint(baseUrl, "Jev Base URL");
+    if (!input.model.trim() || input.model.length > 256) throw new ValidationError("Profile 模型无效");
+    if (!Number.isInteger(input.priority ?? 100) || (input.priority ?? 100) < 0 || (input.priority ?? 100) > 100000) throw new ValidationError("Profile 优先级无效");
+    if (!Number.isInteger(input.timeoutMs ?? 2000) || (input.timeoutMs ?? 2000) < 100 || (input.timeoutMs ?? 2000) > 60000) throw new ValidationError("Profile 超时无效");
+    const ciphertext = input.apiKey?.trim() ? encryptSecret(input.apiKey.trim(), config.sessionSecret) : null;
+    if (!this.pool) {
+      const current = this.aiProfiles.get(id);
+      const ciphertext = input.apiKey === undefined ? current?.apiKeyCiphertext ?? null : input.apiKey?.trim() ? encryptSecret(input.apiKey.trim(), config.sessionSecret) : null;
+      const profile = { id, name: input.name.trim(), baseUrl, model: input.model.trim(), enabled: input.enabled ?? current?.enabled ?? true, priority: input.priority ?? current?.priority ?? 100, timeoutMs: input.timeoutMs ?? current?.timeoutMs ?? 2000, apiKeyConfigured: Boolean(ciphertext || (id === "default" && config.environmentApiKey)), apiKeyCiphertext: ciphertext };
+      this.aiProfiles.set(id, profile);
+      if (id === "default") await this.updateSettings({ jevBaseUrl: baseUrl, model: profile.model, aiTimeoutMs: profile.timeoutMs, ...(input.apiKey === undefined ? {} : { apiKey: input.apiKey }) });
+      this.local!.writeState(this.snapshot());
+      const { apiKeyCiphertext: _secret, ...publicProfile } = profile;
+      return structuredClone(publicProfile);
+    }
+    await this.pool.query(`INSERT INTO ai_profiles(id,name,base_url,model,api_key_ciphertext,enabled,priority,timeout_ms,updated_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,base_url=EXCLUDED.base_url,model=EXCLUDED.model,
+      api_key_ciphertext=COALESCE(EXCLUDED.api_key_ciphertext,ai_profiles.api_key_ciphertext),enabled=EXCLUDED.enabled,priority=EXCLUDED.priority,timeout_ms=EXCLUDED.timeout_ms,updated_at=NOW()`,
+      [id, input.name.trim(), baseUrl, input.model.trim(), ciphertext, input.enabled ?? true, input.priority ?? 100, input.timeoutMs ?? 2000]);
+    return (await this.listAiProfiles()).find((profile) => profile.id === id)!;
+  }
+
+  async deleteAiProfile(id: string): Promise<void> {
+    if (id === "default") throw new ConflictError("默认 Profile 不能删除");
+    if (!this.pool) {
+      if (id === "default") throw new ConflictError("默认 Profile 不能删除");
+      this.aiProfiles.delete(id);
+      this.local!.writeState(this.snapshot());
+      return;
+    }
+    await this.pool.query("DELETE FROM ai_profiles WHERE id=$1", [id]);
+  }
+
+  private async ensureDefaultAiProfile(): Promise<void> {
+    if (!this.pool) return;
+    const exists = await this.pool.query("SELECT 1 FROM ai_profiles LIMIT 1");
+    if (!exists.rowCount) {
+      await this.pool.query("INSERT INTO ai_profiles(id,name,base_url,model,api_key_ciphertext,enabled,priority,timeout_ms) VALUES('default',$1,$2,$3,$4,TRUE,100,$5)", ["默认 Jev", this.settings.jevBaseUrl, this.settings.model, this.apiKeyCiphertext, this.settings.aiTimeoutMs]);
+    }
   }
 
   setupStatus(): {
@@ -370,7 +519,7 @@ export class Store {
 
   private async commitSettings(next: SettingsUpdate): Promise<AppSettings> {
     const { apiKey, ...settings } = next;
-    const candidate = {
+    const candidate: AppSettings = {
       ...this.settings,
       ...settings,
       jevBaseUrl: settings.jevBaseUrl ? normalizeBaseUrl(settings.jevBaseUrl) : this.settings.jevBaseUrl
@@ -396,12 +545,22 @@ export class Store {
       ? (apiKeyCiphertext ? decryptSecret(apiKeyCiphertext, config.sessionSecret) : config.environmentApiKey)
       : config.openRouterKey;
     candidate.mode = effectiveApiKey ? candidate.mode : "traditional";
+    candidate.auditMode = candidate.auditMode === "async" ? "async" : "sync";
+    candidate.whitelistCidrs = readStringArray(candidate.whitelistCidrs);
+    candidate.maliciousIpCidrs = readStringArray(candidate.maliciousIpCidrs);
+    candidate.waitRoomDefaults = parseWaitRoom(candidate.waitRoomDefaults);
+    candidate.captcha = parseCaptcha(candidate.captcha);
     validateSettings(candidate);
     const sites = this.listSites().map((site) => ({
       ...site,
       upstreamUrl: site.id === "default" ? candidate.upstreamUrl : site.upstreamUrl,
       mode: effectiveProtectionMode(site.id === "default" ? candidate.mode : site.mode, Boolean(effectiveApiKey))
-      ,revision: (site.revision ?? 1) + 1
+      ,revision: (site.revision ?? 1) + 1,
+      operationMode: site.operationMode ?? "defense",
+      aiProfileId: site.aiProfileId ?? null,
+      waitRoom: parseWaitRoom(site.waitRoom ?? candidate.waitRoomDefaults),
+      maintenance: parsePageConfig(site.maintenance, 503),
+      upstreamError: parsePageConfig(site.upstreamError, 502)
     }));
     const client = this.pool ? await this.pool.connect() : null;
     try {
@@ -412,18 +571,26 @@ export class Store {
            model = $4, jev_base_url = $5, ai_timeout_ms = $6, ai_body_limit = $7,
            upstream_url = $8,
            api_key_ciphertext = CASE WHEN $9::boolean THEN $10::text ELSE api_key_ciphertext END,
-           default_policy = $11::jsonb, updated_at = NOW() WHERE id = 1`,
+           default_policy = $11::jsonb, audit_mode = $12, async_ban_base_seconds = $13,
+           async_ban_increment_seconds = $14, async_ban_max_seconds = $15,
+           whitelist_cidrs = $16::jsonb, malicious_ip_cidrs = $17::jsonb,
+           wait_room_defaults = $18::jsonb, captcha = $19::jsonb, updated_at = NOW() WHERE id = 1`,
           [
             candidate.mode, candidate.strength, candidate.customThreshold, candidate.model,
             candidate.jevBaseUrl, candidate.aiTimeoutMs, candidate.aiBodyLimit, candidate.upstreamUrl,
             apiKey !== undefined,
-            apiKeyCiphertext ?? null, JSON.stringify(candidate.defaultPolicy)
+            apiKeyCiphertext ?? null, JSON.stringify(candidate.defaultPolicy), candidate.auditMode,
+            candidate.asyncBanBaseSeconds, candidate.asyncBanIncrementSeconds, candidate.asyncBanMaxSeconds,
+            JSON.stringify(candidate.whitelistCidrs), JSON.stringify(candidate.maliciousIpCidrs),
+            JSON.stringify(candidate.waitRoomDefaults), JSON.stringify(candidate.captcha)
           ]
         );
         for (const site of sites) {
           await client.query(
-            `UPDATE sites SET upstream_url = $1, mode = $2, revision = $4 WHERE id = $3`,
-            [site.upstreamUrl, site.mode, site.id, site.revision]
+            `UPDATE sites SET upstream_url = $1, mode = $2, revision = $4, operation_mode = $5,
+             ai_profile_id = $6, wait_room = $7::jsonb, maintenance = $8::jsonb, upstream_error = $9::jsonb WHERE id = $3`,
+            [site.upstreamUrl, site.mode, site.id, site.revision, site.operationMode, site.aiProfileId,
+              JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError)]
           );
         }
         await client.query("COMMIT");
@@ -529,7 +696,7 @@ export class Store {
       }
       const duplicate = [...this.sites.values()].find((site) => site.id !== input.id && site.listenPort === listenPort);
       if (duplicate) throw new ConflictError(`入口端口 ${listenPort} 已被站点“${duplicate.name}”占用`);
-      const site: Site = {
+      const site: Site = this.normalizeSite({
         id: input.id ?? randomUUID(),
         name: input.name,
         listenPort,
@@ -538,8 +705,13 @@ export class Store {
         enabled: input.enabled,
         createdAt: current?.createdAt ?? new Date().toISOString(),
         policy: input.policy === undefined ? current?.policy ?? null : input.policy === null ? null : parsePolicy(input.policy),
-        revision: (current?.revision ?? 0) + 1
-      };
+        revision: (current?.revision ?? 0) + 1,
+        operationMode: input.operationMode ?? current?.operationMode ?? "defense",
+        aiProfileId: input.aiProfileId ?? current?.aiProfileId ?? null,
+        waitRoom: input.waitRoom ?? current?.waitRoom ?? this.settings.waitRoomDefaults,
+        maintenance: input.maintenance ?? current?.maintenance ?? { source: "default", statusCode: 503 },
+        upstreamError: input.upstreamError ?? current?.upstreamError ?? { source: "default", statusCode: 502 }
+      });
       const settings = site.id === "default"
         ? { ...this.settings, upstreamUrl: site.upstreamUrl, mode: site.mode }
         : this.settings;
@@ -548,12 +720,16 @@ export class Store {
         if (client) {
           await client.query("BEGIN");
           await client.query(
-            `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled, policy, revision, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled, policy, revision, created_at,
+             operation_mode, ai_profile_id, wait_room, maintenance, upstream_error)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb)
              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, listen_port = EXCLUDED.listen_port,
              upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled,
-             policy = EXCLUDED.policy, revision = EXCLUDED.revision`,
-            [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled, site.policy ? JSON.stringify(site.policy) : null, site.revision, site.createdAt]
+             policy = EXCLUDED.policy, revision = EXCLUDED.revision, operation_mode = EXCLUDED.operation_mode,
+             ai_profile_id = EXCLUDED.ai_profile_id, wait_room = EXCLUDED.wait_room,
+             maintenance = EXCLUDED.maintenance, upstream_error = EXCLUDED.upstream_error`,
+            [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled, site.policy ? JSON.stringify(site.policy) : null, site.revision, site.createdAt,
+              site.operationMode, site.aiProfileId, JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError)]
           );
           if (site.id === "default") {
             await client.query(
@@ -897,7 +1073,36 @@ export class Store {
     return {
       settings: this.settings, initialized: this.initialized, credential: this.credential,
       apiKeyCiphertext: this.apiKeyCiphertext, rules: this.rules, sites: [...this.sites.values()],
+      aiProfiles: [...this.aiProfiles.values()],
       builtinRuleIds: [...this.builtinRuleIds], scopedRules: this.scopedRules
+    };
+  }
+
+  private normalizeSettingsDefaults(): void {
+    const defaults = defaultSettings();
+    this.settings = {
+      ...defaults,
+      ...this.settings,
+      defaultPolicy: this.settings.defaultPolicy ?? defaults.defaultPolicy,
+      auditMode: this.settings.auditMode === "async" ? "async" : "sync",
+      asyncBanBaseSeconds: Number.isFinite(this.settings.asyncBanBaseSeconds) ? this.settings.asyncBanBaseSeconds : defaults.asyncBanBaseSeconds,
+      asyncBanIncrementSeconds: Number.isFinite(this.settings.asyncBanIncrementSeconds) ? this.settings.asyncBanIncrementSeconds : defaults.asyncBanIncrementSeconds,
+      asyncBanMaxSeconds: Number.isFinite(this.settings.asyncBanMaxSeconds) ? this.settings.asyncBanMaxSeconds : defaults.asyncBanMaxSeconds,
+      whitelistCidrs: Array.isArray(this.settings.whitelistCidrs) ? this.settings.whitelistCidrs : [],
+      maliciousIpCidrs: Array.isArray(this.settings.maliciousIpCidrs) ? this.settings.maliciousIpCidrs : [],
+      waitRoomDefaults: parseWaitRoom(this.settings.waitRoomDefaults),
+      captcha: parseCaptcha(this.settings.captcha)
+    };
+  }
+
+  private normalizeSite(site: Site): Site {
+    return {
+      ...site,
+      operationMode: site.operationMode === "record" || site.operationMode === "maintenance" ? site.operationMode : "defense",
+      aiProfileId: site.aiProfileId ?? null,
+      waitRoom: parseWaitRoom(site.waitRoom ?? this.settings.waitRoomDefaults),
+      maintenance: parsePageConfig(site.maintenance, 503),
+      upstreamError: parsePageConfig(site.upstreamError, 502)
     };
   }
 
@@ -1003,6 +1208,9 @@ function validateSettings(settings: AppSettings): void {
   if (!Number.isInteger(settings.aiTimeoutMs) || settings.aiTimeoutMs < 100 || settings.aiTimeoutMs > 60000) throw new ValidationError("AI 超时必须在 100 到 60000 毫秒之间");
   if (!Number.isInteger(settings.aiBodyLimit) || settings.aiBodyLimit < 1024 || settings.aiBodyLimit > config.maxRequestBodyBytes) throw new ValidationError("AI 正文限制超出有效范围");
   if (!settings.model.trim() || settings.model.length > 256) throw new ValidationError("模型名称无效");
+  if (!Number.isInteger(settings.asyncBanBaseSeconds) || settings.asyncBanBaseSeconds < 1 || settings.asyncBanBaseSeconds > 86400) throw new ValidationError("异步封禁基础时长无效");
+  if (!Number.isInteger(settings.asyncBanIncrementSeconds) || settings.asyncBanIncrementSeconds < 1 || settings.asyncBanIncrementSeconds > 86400) throw new ValidationError("异步封禁递增时长无效");
+  if (!Number.isInteger(settings.asyncBanMaxSeconds) || settings.asyncBanMaxSeconds < settings.asyncBanBaseSeconds || settings.asyncBanMaxSeconds > 604800) throw new ValidationError("异步封禁最大时长无效");
   for (const value of [settings.upstreamUrl, settings.jevBaseUrl]) {
     let url: URL;
     try { url = new URL(value); } catch { throw new ValidationError("服务地址必须是完整 HTTP(S) URL"); }
@@ -1017,6 +1225,7 @@ function validateSite(site: Omit<Site, "createdAt" | "id"> & { id?: string }): v
   if (!isSitePort(site.listenPort)) throw new ValidationError(`入口端口必须在 ${formatPortRange()} 范围内`);
   if (!["ai", "traditional", "hybrid"].includes(site.mode)) throw new ValidationError("站点防护模式无效");
   if (typeof site.enabled !== "boolean") throw new ValidationError("站点启用状态无效");
+  if (!["defense", "record", "maintenance"].includes(site.operationMode ?? "defense")) throw new ValidationError("站点运行模式无效");
   validateHttpEndpoint(site.upstreamUrl, "上游地址");
 }
 
@@ -1056,6 +1265,45 @@ function decodeCursor(value: string): { time: string; id: string } {
 function normalizeBaseUrl(value: string): string {
   const trimmed = value.trim().replace(/\/+$/, "");
   return trimmed.replace(/\/api\/(?:alpha|v1)\/decisions$/, "");
+}
+
+function readStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+  if (typeof value === "string") {
+    try { return readStringArray(JSON.parse(value)); } catch { return []; }
+  }
+  return [];
+}
+
+function parseWaitRoom(value: unknown): WaitRoomConfig {
+  const source = typeof value === "object" && value !== null ? value as Partial<WaitRoomConfig> : {};
+  return {
+    enabled: Boolean(source.enabled),
+    maxActive: clampInteger(source.maxActive, 100, 1, 100000),
+    maxQueue: clampInteger(source.maxQueue, 100, 0, 100000),
+    timeoutSeconds: clampInteger(source.timeoutSeconds, 60, 1, 86400)
+  };
+}
+
+function parsePageConfig(value: unknown, statusCode: number): PageConfig {
+  const source = typeof value === "object" && value !== null ? value as Partial<PageConfig> : {};
+  const sourceType = source.source === "file" || source.source === "inline" ? source.source : "default";
+  return {
+    source: sourceType,
+    ...(typeof source.filePath === "string" && source.filePath ? { filePath: source.filePath } : {}),
+    ...(typeof source.html === "string" && source.html ? { html: source.html } : {}),
+    statusCode: clampInteger(source.statusCode, statusCode, 400, 599)
+  };
+}
+
+function parseCaptcha(value: unknown): AppSettings["captcha"] {
+  const source = typeof value === "object" && value !== null ? value as Partial<AppSettings["captcha"]> : {};
+  const provider = source.provider === "turnstile" || source.provider === "hcaptcha" || source.provider === "recaptcha" ? source.provider : "local";
+  return { enabled: Boolean(source.enabled), provider, siteKey: typeof source.siteKey === "string" ? source.siteKey : "", secretConfigured: Boolean(source.secretConfigured) };
+}
+
+function clampInteger(value: unknown, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
 }
 
 function withRuleMetadata(rule: WafRule): WafRule {
@@ -1111,7 +1359,12 @@ function mapSite(row: QueryResultRow): Site {
     mode: row.mode as ProtectionMode,
     enabled: Boolean(row.enabled),
     createdAt: new Date(row.created_at as string).toISOString(), policy: row.policy ? parsePolicy(row.policy) : null,
-    revision: Number(row.revision ?? 1)
+    revision: Number(row.revision ?? 1),
+    operationMode: row.operation_mode === "record" || row.operation_mode === "maintenance" ? row.operation_mode : "defense",
+    aiProfileId: row.ai_profile_id ? String(row.ai_profile_id) : null,
+    waitRoom: parseWaitRoom(row.wait_room),
+    maintenance: parsePageConfig(row.maintenance, 503),
+    upstreamError: parsePageConfig(row.upstream_error, 502)
   };
 }
 

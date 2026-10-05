@@ -5,6 +5,11 @@ type DecisionsResponse = {
   answers?: Record<string, { noul?: unknown }>;
 };
 
+export type JevProvider = {
+  baseUrl: string;
+  apiKey: string;
+};
+
 let active = 0;
 let windowStarted = Date.now();
 let calls = 0;
@@ -13,7 +18,13 @@ let openUntil = 0;
 const siteCalls = new Map<string, number>();
 export function aiRuntime() { return { active, calls, limit: config.aiRequestsPerMinute, circuitOpen: openUntil > Date.now() }; }
 
-export async function classifyWithJev(state: string, model: string, timeoutMs: number, siteId = "management"): Promise<AiDecision> {
+export async function classifyWithJev(
+  state: string,
+  model: string,
+  timeoutMs: number,
+  siteId = "management",
+  provider?: JevProvider
+): Promise<AiDecision> {
   const started = performance.now();
   const unavailable = (errorCode: string): AiDecision => ({ model, noul: 0, available: false,
     latencyMs: Math.round(performance.now() - started), error: errorCode, errorCode });
@@ -21,7 +32,9 @@ export async function classifyWithJev(state: string, model: string, timeoutMs: n
   if (openUntil > Date.now()) return unavailable("circuit_open");
   if (active >= config.aiMaxConcurrent) return unavailable("concurrency_limit");
   if (calls >= config.aiRequestsPerMinute || (siteCalls.get(siteId) ?? 0) >= Math.max(1, Math.ceil(config.aiRequestsPerMinute / 2))) return unavailable("budget_exhausted");
-  if (!config.openRouterKey) {
+  const apiKey = provider?.apiKey ?? config.openRouterKey;
+  const configuredBaseUrl = provider?.baseUrl ?? config.jevBaseUrl;
+  if (!apiKey) {
     return {
       model,
       noul: 0,
@@ -37,11 +50,11 @@ export async function classifyWithJev(state: string, model: string, timeoutMs: n
   calls += 1;
   siteCalls.set(siteId, (siteCalls.get(siteId) ?? 0) + 1);
   try {
-    const baseUrl = config.jevBaseUrl.replace(/\/+$/, "").replace(/\/api\/(?:alpha|v1)\/decisions$/, "");
+    const baseUrl = configuredBaseUrl.replace(/\/+$/, "").replace(/\/api\/(?:alpha|v1)\/decisions$/, "");
     const response = await fetch(`${baseUrl}/api/alpha/decisions`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${config.openRouterKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
         "HTTP-Referer": "http://localhost:3000",
         "X-Title": "JianFlow WAF"

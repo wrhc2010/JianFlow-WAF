@@ -77,6 +77,11 @@ ALTER TABLE settings ADD COLUMN IF NOT EXISTS jev_base_url TEXT NOT NULL DEFAULT
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS listen_port INTEGER;
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS policy JSONB;
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS operation_mode TEXT NOT NULL DEFAULT 'defense';
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS ai_profile_id TEXT;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS wait_room JSONB NOT NULL DEFAULT '{"enabled":false,"maxActive":100,"maxQueue":100,"timeoutSeconds":60}'::jsonb;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS maintenance JSONB NOT NULL DEFAULT '{"source":"default","statusCode":503}'::jsonb;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS upstream_error JSONB NOT NULL DEFAULT '{"source":"default","statusCode":502}'::jsonb;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS api_key_ciphertext TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_salt TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_hash TEXT;
@@ -92,6 +97,26 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS asn INTEGER;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS finalized BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS default_policy JSONB;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS audit_mode TEXT NOT NULL DEFAULT 'sync';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS async_ban_base_seconds INTEGER NOT NULL DEFAULT 60;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS async_ban_increment_seconds INTEGER NOT NULL DEFAULT 60;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS async_ban_max_seconds INTEGER NOT NULL DEFAULT 86400;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS whitelist_cidrs JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS malicious_ip_cidrs JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS wait_room_defaults JSONB NOT NULL DEFAULT '{"enabled":false,"maxActive":100,"maxQueue":100,"timeoutSeconds":60}'::jsonb;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS captcha JSONB NOT NULL DEFAULT '{"enabled":false,"provider":"local","siteKey":"","secretConfigured":false}'::jsonb;
+CREATE TABLE IF NOT EXISTS ai_profiles (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  model TEXT NOT NULL,
+  api_key_ciphertext TEXT,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  priority INTEGER NOT NULL DEFAULT 100,
+  timeout_ms INTEGER NOT NULL DEFAULT 2000,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ALTER TABLE events ADD COLUMN IF NOT EXISTS site_id TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS context JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE TABLE IF NOT EXISTS scoped_rules (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, kind TEXT NOT NULL, value JSONB NOT NULL);

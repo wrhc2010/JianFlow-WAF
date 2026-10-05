@@ -1,6 +1,6 @@
 # JianFlow WAF
 
-A self-hosted Web Application Firewall that checks HTTP requests using local rules, Jev AI classification, or both. This guide targets Linux servers and uses Bash commands for v0.2.2.
+A self-hosted Web Application Firewall that checks HTTP requests using local rules, Jev AI classification, or both. This guide targets Linux servers and uses Bash commands for v0.3.0.
 
 [![License: MIT](https://img.shields.io/github/license/wrhc2010/JianFlow-WAF)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/wrhc2010/JianFlow-WAF)](https://github.com/wrhc2010/JianFlow-WAF/releases)
@@ -11,7 +11,7 @@ A self-hosted Web Application Firewall that checks HTTP requests using local rul
 
 Run a test deployment before connecting real traffic. A production rollout still needs a security audit, load testing, and staged validation for your application. See the [changelog](CHANGELOG.md) for release details.
 
-Version 0.2.2 adds site policy overrides, observation mode, exact field-level exceptions, mandatory access controls, and basic CC limits. It also fixes HTTP/HTTPS enablement, strict Jev response validation, AI redaction, and inspection coverage. Local rules remain the foundation; AI is optional. Models and provider timeouts remain global, while each site can inherit or override its protection policy.
+Version 0.3.0 adds the mint workstation UI, light/dark themes, collapsible navigation, site defense/record/maintenance modes, per-site waiting rooms, and multiple Jev/API profiles. Nginx is recommended as the TLS and ingress layer while Node WAF remains responsible for rules, review, events, and security decisions. Local rules remain the foundation; AI is optional.
 
 ## Screenshot
 
@@ -96,14 +96,14 @@ The default site still uses `PROXY_PORT`, which defaults to `8080`; a custom ran
 
 ### Use release images
 
-To skip the build, download both image archives from the [v0.2.2 release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.2.2). Prepare configuration and the password file as above, then import the images:
+To skip the build, download both image archives from the [v0.3.0 release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.3.0). Prepare configuration and the password file as above, then import the images:
 
 ```bash
-sha256sum -c jianflow-waf-api-v0.2.2.tar.gz.sha256
-sha256sum -c jianflow-waf-web-v0.2.2.tar.gz.sha256
-docker load -i jianflow-waf-api-v0.2.2.tar.gz
-docker load -i jianflow-waf-web-v0.2.2.tar.gz
-IMAGE_TAG=v0.2.2 docker compose up -d --no-build --pull never
+sha256sum -c jianflow-waf-api-v0.3.0.tar.gz.sha256
+sha256sum -c jianflow-waf-web-v0.3.0.tar.gz.sha256
+docker load -i jianflow-waf-api-v0.3.0.tar.gz
+docker load -i jianflow-waf-web-v0.3.0.tar.gz
+IMAGE_TAG=v0.3.0 docker compose up -d --no-build --pull never
 ```
 
 `--pull never` will not download missing images. If the PostgreSQL image is not available locally, run `docker pull postgres:16-alpine` first.
@@ -147,7 +147,7 @@ It should return `403` without needing the upstream or AI service.
 - **Rules**: local request normalization and rules for common SQL injection, XSS, traversal, template injection, NoSQL injection, command injection, and unsafe URL patterns. JSON and supported ModSecurity `SecRule` imports include preview, validation, conflict handling, and atomic writes; this is not the full OWASP CRS engine.
 - **Hybrid**: local rules first, then Jev for suspicious requests by default. Select all requests or asynchronous shadow evaluation when needed. The inherited hybrid failure policy continues the local result and records the failure.
 - **Inspection**: checks paths, queries, headers, cookies, IPs, and complete request bodies, including JSON, forms, XML, multipart, text, and gzip/deflate/brotli bodies. HTTP and WebSocket handshakes are inspected; subsequent WebSocket frames are passed through.
-- **Sites**: port-based site cards with separate upstream URLs and protection modes, plus create, edit, enable, disable, and delete actions. The default site cannot be deleted.
+- **Sites**: port-based site cards with separate upstream URLs and protection modes, plus create, edit, enable, disable, and delete actions. The default site cannot be deleted. Maintenance and upstream-error responses currently use built-in pages or controlled inline HTML.
 - **Console and storage**: all-history statistics, cursor pagination, filters, rule management, encrypted API key storage, PostgreSQL or persistent SQLite, and offline GeoIP with 2D/3D attack views.
 
 Threshold presets are 10%, 30%, 50%, 70%, and 90%, with custom values from 0% to 100%. Lower thresholds block more requests; stored values are unchanged by this upgrade. Configure Jev in the console or use server-side environment variables:
@@ -168,7 +168,9 @@ AI admission has no waiting queue: defaults are 8 concurrent calls and 120 calls
 
 `LOG_RETENTION_DAYS` defaults to 30. Cleanup removes at most 1000 expired details per minute, so a large backlog needs multiple passes. Trends and maps use retained details; independent counters preserve all-history totals. SQLite uses indexed SQL queries rather than loading full history. The system endpoint exposes event queue depth, drops, and write errors; details may be dropped when the queue is full.
 
-For offline GeoIP in Docker, place your `GeoIP2-City.mmdb` and `GeoIP2-ASN.mmdb` files under `./geoip` and use the container paths shown above. Without the databases, source locations remain unknown.
+For offline GeoIP in Docker, place your `GeoIP2-City.mmdb` and `GeoIP2-ASN.mmdb` files under `./geoip` and use the container paths shown above. Without the databases, source locations remain unknown. The current release does not provide a WebUI upload flow for MMDB files.
+
+The repository includes a safe-subset Nginx preview parser and configuration fields for asynchronous review, CAPTCHA, IP feeds, and custom pages. The management routes, generated Nginx reload flow, asynchronous IP ban enforcement, active-connection interruption, CAPTCHA token validation, and runtime threat-feed enforcement are not yet complete production features in this release; do not treat those fields as enabled merely because they appear in settings.
 
 For HTTPS on the **WAF entry point**, put readable certificate files under `./certs` and set:
 
