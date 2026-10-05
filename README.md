@@ -19,9 +19,9 @@
 
 ## 这版重点
 
-`v0.3.0` 换成青绿工作台，支持深色模式和图标导航。Compose 统一由 Nginx 提供入口，API 不再直接暴露在宿主机。
+`v0.3.1` 延续青绿工作台，支持深色模式和图标导航。Compose 统一由 Nginx 提供入口，API 不再直接暴露在宿主机。
 
-目前 `main` 还包含发布后的验收修正，尚未更新已发布的 `v0.3.0` 标签和镜像包。下面的快速开始使用 `main` 源码构建；使用旧标签或 Release 包不会包含这些修正。
+这版收录了 `v0.3.0` 发布后的验收修正，包括浏览器排队和人机验证、HTTPS 票据 Cookie、独立 CC 记录策略与弹窗焦点。新部署请使用 `v0.3.1`；旧 `v0.3.0` 标签和镜像包保持不变。
 
 - 按端口管理多个站点，默认范围 `8080-8099`。每站点可以使用不同上游、加权轮询池或 301/302 跳转。
 - 站点支持防御、记录、维护模式，以及按活动请求并发排队的等候室。
@@ -37,7 +37,7 @@
 
 ## 在 Linux 上部署
 
-以下步骤面向 Linux 服务器，命令使用 Bash，配置对应当前 `main`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
+以下步骤面向 Linux 服务器，命令使用 Bash，配置对应 `v0.3.1`。先准备一套测试环境，再接入真实业务。完整变更见 [更新日志](CHANGELOG.md)。
 
 需要 Git、curl、OpenSSL，以及已安装并运行的 Docker Engine 和 Docker Compose v2.24.4 或更高版本。使用容器部署不需要在宿主机安装 Node.js。
 
@@ -46,7 +46,7 @@
 ```bash
 git clone https://github.com/wrhc2010/JianFlow-WAF.git
 cd JianFlow-WAF
-git checkout main
+git checkout v0.3.1
 cp .env.example .env
 chmod 600 .env
 mkdir -p secrets certs geoip config pages
@@ -150,22 +150,20 @@ Compose 的 `web` 镜像包含控制台和 Nginx，不需要另起一个 Nginx �
 
 ### 使用发布镜像
 
-现有 `v0.3.0` 包对应提交 `a3b5783`，不包含本轮验收修正。要验证本 README 描述的当前行为，请先使用上面的源码构建方式。以下命令仅用于部署已有发布包，并使用对应标签的 Compose 配置。
-
-不想在服务器构建时，可以从 [v0.3.0 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.3.0) 下载 API 和 Web 镜像压缩包。先按上面的步骤准备配置和密码文件，再导入镜像：
+不想在服务器构建时，可以从 [v0.3.1 Release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.3.1) 下载 API、Web 镜像压缩包及各自的 `.sha256` 文件，放到项目目录。先按上面的步骤准备配置和密码文件，再校验并导入镜像：
 
 ```bash
-git checkout v0.3.0
-sha256sum -c jianflow-waf-api-v0.3.0.tar.gz.sha256
-sha256sum -c jianflow-waf-web-v0.3.0.tar.gz.sha256
-docker load -i jianflow-waf-api-v0.3.0.tar.gz
-docker load -i jianflow-waf-web-v0.3.0.tar.gz
-IMAGE_TAG=v0.3.0 docker compose up -d --no-build --pull never
+git checkout v0.3.1
+sha256sum -c jianflow-waf-api-v0.3.1.tar.gz.sha256
+sha256sum -c jianflow-waf-web-v0.3.1.tar.gz.sha256
+docker load -i jianflow-waf-api-v0.3.1.tar.gz
+docker load -i jianflow-waf-web-v0.3.1.tar.gz
+IMAGE_TAG=v0.3.1 docker compose up -d --no-build --pull never
 ```
 
 `--pull never` 不会下载缺失的镜像；如果本机还没有 PostgreSQL 镜像，先运行 `docker pull postgres:16-alpine`。
 
-请同时下载对应的 `.sha256` 文件。GHCR 是否允许匿名拉取取决于 GitHub 包权限；这里以 Release 镜像包作为不需要 GHCR 登录的部署入口。
+后续重建或更新容器时也要指定 `IMAGE_TAG=v0.3.1`，或者将它写入 `.env`，避免无意中使用 `latest`。GHCR 是否允许匿名拉取取决于 GitHub 包权限；这里以 Release 镜像包作为不需要 GHCR 登录的部署入口。
 
 ### 日志和日常维护
 
@@ -187,12 +185,12 @@ docker compose down
 docker run --rm -v jianflow-waf_jevwaf-data:/data:ro -v "$PWD":/backup alpine \
   tar -czf /backup/jianflow-data.tar.gz -C /data .
 git fetch --tags
-git checkout main
+git checkout v0.3.1
 docker compose up -d --build
 curl -fsS http://127.0.0.1:3000/api/v1/health/ready
 ```
 
-上面的卷名只适用于默认目录名；先用 `docker volume ls` 核对自己的 Compose 项目名。SQLite 部署省略 `pg_dump`，停机后备份 API 卷即可。`.env`、`secrets`、`config`、`pages`、`geoip` 和证书也要单独备份；镜像需提前导入。迁移保留旧事件、规则、站点和管理员，旧 Jev 配置转成默认 Profile，默认端口仍是 `8080`。
+上面的卷名只适用于默认目录名；先用 `docker volume ls` 核对自己的 Compose 项目名。SQLite 部署省略 `pg_dump`，停机后备份 API 卷即可。`.env`、`secrets`、`config`、`pages`、`geoip` 和证书也要单独备份。使用 Release 镜像升级时，先按“使用发布镜像”导入新版镜像，再用 `IMAGE_TAG=v0.3.1 docker compose up -d --no-build --pull never` 代替构建命令。迁移保留旧事件、规则、站点和管理员，旧 Jev 配置转成默认 Profile，默认端口仍是 `8080`。
 
 回滚时停止新版，恢复升级前的数据库、API 数据卷及配置，然后启动旧标签。不要让旧程序直接写入迁移后的数据库。备份包含密钥材料，限制读取权限并离线保管。
 

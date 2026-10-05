@@ -1,6 +1,6 @@
 # JianFlow WAF
 
-A self-hosted Web Application Firewall that checks HTTP requests using local rules, Jev AI classification, or both. This guide targets Linux servers and uses Bash commands for v0.3.0.
+A self-hosted Web Application Firewall that checks HTTP requests using local rules, Jev AI classification, or both. This guide targets Linux servers and uses Bash commands for v0.3.1.
 
 [![License: MIT](https://img.shields.io/github/license/wrhc2010/JianFlow-WAF)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/wrhc2010/JianFlow-WAF)](https://github.com/wrhc2010/JianFlow-WAF/releases)
@@ -11,9 +11,9 @@ A self-hosted Web Application Firewall that checks HTTP requests using local rul
 
 Run a test deployment before connecting real traffic. A production rollout still needs a security audit, load testing, and staged validation for your application. See the [changelog](CHANGELOG.md) for release details.
 
-Version 0.3.0 adds the mint workstation UI, light/dark themes, icon-only navigation, multiple API profiles, waiting rooms, asynchronous review and visitor challenges. Compose uses Nginx as the public entry and TLS layer; the Node WAF handles inspection, upstream routing, events and bans. Local rules work without AI.
+Version 0.3.1 keeps the mint workstation UI, light/dark themes, icon-only navigation, multiple API profiles, waiting rooms, asynchronous review and visitor challenges. Compose uses Nginx as the public entry and TLS layer; the Node WAF handles inspection, upstream routing, events and bans. Local rules work without AI.
 
-The current `main` branch includes post-release acceptance fixes that are not yet in the published `v0.3.0` tag or image archives. The quick start below builds `main`; checking out the old tag or loading its archives does not include these fixes.
+This release includes the post-0.3.0 acceptance fixes for browser admission and challenges, secure waiting-room cookies behind TLS gateways, independent CC observation, and dialog focus. Use `v0.3.1` for new deployments; the old `v0.3.0` tag and archives remain unchanged.
 
 ## Screenshot
 
@@ -30,7 +30,7 @@ Requires Git, curl, OpenSSL, Docker Engine, and Docker Compose v2.24.4 or newer.
 ```bash
 git clone https://github.com/wrhc2010/JianFlow-WAF.git
 cd JianFlow-WAF
-git checkout main
+git checkout v0.3.1
 cp .env.example .env
 chmod 600 .env
 mkdir -p secrets certs geoip config pages
@@ -107,22 +107,20 @@ The default site still uses `PROXY_PORT`, which defaults to `8080`; a custom ran
 
 ### Use release images
 
-The existing `v0.3.0` archives were built from `a3b5783` and do not contain the current acceptance fixes. Build from source above to verify the behavior described in this README. The following commands deploy the existing archives with their matching tagged Compose configuration.
-
-To skip the build, download both image archives from the [v0.3.0 release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.3.0). Prepare configuration and the password file as above, then import the images:
+To skip the build, download both image archives and their `.sha256` files from the [v0.3.1 release](https://github.com/wrhc2010/JianFlow-WAF/releases/tag/v0.3.1) into the project directory. Prepare configuration and the password file as above, then verify and import the images:
 
 ```bash
-git checkout v0.3.0
-sha256sum -c jianflow-waf-api-v0.3.0.tar.gz.sha256
-sha256sum -c jianflow-waf-web-v0.3.0.tar.gz.sha256
-docker load -i jianflow-waf-api-v0.3.0.tar.gz
-docker load -i jianflow-waf-web-v0.3.0.tar.gz
-IMAGE_TAG=v0.3.0 docker compose up -d --no-build --pull never
+git checkout v0.3.1
+sha256sum -c jianflow-waf-api-v0.3.1.tar.gz.sha256
+sha256sum -c jianflow-waf-web-v0.3.1.tar.gz.sha256
+docker load -i jianflow-waf-api-v0.3.1.tar.gz
+docker load -i jianflow-waf-web-v0.3.1.tar.gz
+IMAGE_TAG=v0.3.1 docker compose up -d --no-build --pull never
 ```
 
 `--pull never` will not download missing images. If the PostgreSQL image is not available locally, run `docker pull postgres:16-alpine` first.
 
-Download the matching `.sha256` files as well. Anonymous GHCR access depends on GitHub package permissions; Release archives remain the deployment path that does not require a GHCR login.
+Keep specifying `IMAGE_TAG=v0.3.1` for later container recreation, or save it in `.env`, so you do not accidentally use `latest`. Anonymous GHCR access depends on GitHub package permissions; Release archives remain the deployment path that does not require a GHCR login.
 
 ### Logs and maintenance
 
@@ -138,7 +136,7 @@ docker compose down
 
 Back up before checking out a new tag. Dump PostgreSQL with `docker compose exec -T postgres pg_dump -U jevwaf jevwaf > backup.sql`, stop the deployment, and archive its API data volume. SQLite needs an offline API-volume backup instead of `pg_dump`. Use `docker volume ls` to identify your actual volume names; also preserve `.env`, secrets, certificates, config, pages and GeoIP files. Backups contain key material and need restricted access.
 
-For the current fixes, check out `main` and run `docker compose up -d --build`. For a published release, load its images and use the matching source tag and `IMAGE_TAG`. Check `/api/v1/health/ready` through port 3000. Existing users, rules, events and sites remain; old Jev settings become the default Profile and port 8080 remains the default entry. To roll back, stop the new services and restore the pre-upgrade database, API volume and configuration before starting the old tag. Do not run an old binary against a migrated database.
+Fetch tags, check out `v0.3.1` and run `docker compose up -d --build`. If upgrading with Release archives, load the images first and use `IMAGE_TAG=v0.3.1 docker compose up -d --no-build --pull never` instead. Check `/api/v1/health/ready` through port 3000. Existing users, rules, events and sites remain; old Jev settings become the default Profile and port 8080 remains the default entry. To roll back, stop the new services and restore the pre-upgrade database, API volume and configuration before starting the old tag. Do not run an old binary against a migrated database.
 
 ## Develop locally on Linux
 
