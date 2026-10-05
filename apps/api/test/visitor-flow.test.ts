@@ -90,6 +90,7 @@ test("browser waiting tickets preserve FIFO, isolate custom HTML and honor queue
   assert.match(queued.body, /Custom queue/);
   assert.match(queued.body, /<iframe[^>]+sandbox/);
   assert.match(queued.headers["content-security-policy"]!, /script-src 'nonce-/);
+  assert.equal(queued.headers["referrer-policy"], "no-referrer");
   const cookie = queued.headers["set-cookie"]![0]!.split(";")[0]!;
   assert.equal(JSON.parse((await get(port, "/.jianflow/wait/status", { cookie })).body).state, "waiting");
   assert.equal((await get(port, "/", { accept: "text/html", cookie })).status, 202);
@@ -111,6 +112,7 @@ test("visitor PoW verifies once, clears CC bans and strips clearance before forw
   assert.equal((await get(port)).status, 200);
   const rejected = await get(port);
   assert.equal(rejected.status, 403); assert.match(rejected.body, /访问验证/);
+  assert.equal(rejected.headers["referrer-policy"], "no-referrer");
   const challenge = JSON.parse((await get(port, "/.jianflow/captcha/challenge")).body);
   let n = 0;
   while (!createHash("sha256").update(`${challenge.challenge}:${n}`).digest("hex").startsWith("0".repeat(challenge.difficulty))) n++;

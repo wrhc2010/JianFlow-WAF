@@ -47,7 +47,7 @@ function sendWaitingPage(store: Store, request: IncomingMessage, response: Serve
   // Custom HTML never shares the control page's origin or script privileges.
   const preview = custom ? `<iframe title="等候室" sandbox srcdoc="${custom.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!)}" style="width:100%;height:65vh;border:0"></iframe>` : "";
   const body = defaultPage("请稍候", "当前访问较多，正在按顺序安排请求。", preview + runtime);
-  response.writeHead(202, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "set-cookie": `jf_wait=${ticket.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${(site.waitRoom?.timeoutSeconds ?? 60) + 10}${"encrypted" in request.socket && request.socket.encrypted ? "; Secure" : ""}`, "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'self'; frame-src 'self'; img-src data: https:; base-uri 'none'; form-action 'none'` });
+  response.writeHead(202, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer", "set-cookie": `jf_wait=${ticket.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${(site.waitRoom?.timeoutSeconds ?? 60) + 10}${"encrypted" in request.socket && request.socket.encrypted ? "; Secure" : ""}`, "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'self'; frame-src 'self'; img-src data: https:; base-uri 'none'; form-action 'none'` });
   request.resume(); response.end(body);
 }
 

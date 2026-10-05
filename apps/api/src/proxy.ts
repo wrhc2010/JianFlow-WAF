@@ -245,7 +245,7 @@ function captchaOptions(store: Store, siteId: string) {
 
 function challengeResponse(store: Store, response: http.ServerResponse, requestId: string, siteId: string): void {
   const body = captchaPage(captchaOptions(store, siteId));
-  response.writeHead(403, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-jev-request-id": requestId });
+  response.writeHead(403, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer", "x-jev-request-id": requestId });
   response.end(body);
 }
 
