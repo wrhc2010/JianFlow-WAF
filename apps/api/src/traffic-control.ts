@@ -24,7 +24,16 @@ export class TrafficControl {
     return until > now ? Math.max(1, Math.ceil((until - now) / 1000)) : 0;
   }
 
-  enter(siteId: string, ip: string, path: string, policy: SitePolicy, now = Date.now()): { allowed: boolean; reason?: string; retryAfter?: number; release: () => void } {
+  clearBan(siteId: string, ip: string, burst: number): void {
+    const prefix = `${siteId}\0${ip}`;
+    for (const [key, bucket] of this.buckets) if (key === prefix || key.startsWith(`${prefix}\0`)) {
+      bucket.banUntil = 0;
+      bucket.tokens = burst;
+      bucket.updated = Date.now();
+    }
+  }
+
+  enter(siteId: string, ip: string, path: string, policy: SitePolicy, now = Date.now(), options: { whitelisted?: boolean; observe?: boolean } = {}): { allowed: boolean; reason?: string; retryAfter?: number; release: () => void } {
     const denied = (reason: string, seconds = 1) => ({ allowed: false, reason, retryAfter: seconds, release: () => {} });
     if (this.concurrent >= config.maxProxyConcurrent) return denied("global_concurrency");
     if (now - this.lastSweep > 10000) {
@@ -33,7 +42,8 @@ export class TrafficControl {
     }
     const limits = policy.rateLimit;
     let client: Bucket | undefined;
-    if (limits.enabled) {
+    let observed: string | undefined;
+    if (limits.enabled && !options.whitelisted) {
       const scopes = [{ key: `${siteId}\0${ip}`, rate: limits.requestsPerSecond, burst: limits.burst },
         ...limits.paths.filter((entry) => entry.path === path).map((entry) => ({ key: `${siteId}\0${ip}\0${path}`, rate: entry.requestsPerSecond, burst: entry.burst }))];
       for (const scope of scopes) {
@@ -45,12 +55,17 @@ export class TrafficControl {
         }
         bucket.lastSeen = now;
         if (!client) client = bucket;
-        if (bucket.banUntil > now) return denied("temporary_ban", Math.max(1, Math.ceil((bucket.banUntil - now) / 1000)));
+        if (bucket.banUntil > now && !options.observe) return denied("temporary_ban", Math.max(1, Math.ceil((bucket.banUntil - now) / 1000)));
         bucket.tokens = Math.min(scope.burst, bucket.tokens + Math.max(0, now - bucket.updated) * scope.rate / 1000);
         bucket.updated = now;
         if (bucket.tokens < 1 || client.active >= limits.maxConcurrent) {
-          bucket.banUntil = now + limits.blockSeconds * 1000;
-          return denied(bucket.tokens < 1 ? "request_rate" : "client_concurrency", limits.blockSeconds);
+          const reason = bucket.tokens < 1 ? "request_rate" : "client_concurrency";
+          if (!options.observe) {
+            bucket.banUntil = now + limits.blockSeconds * 1000;
+            return denied(reason, limits.blockSeconds);
+          }
+          observed = reason;
+          continue;
         }
         bucket.tokens -= 1;
       }
@@ -58,7 +73,7 @@ export class TrafficControl {
     this.concurrent += 1;
     if (client) client.active += 1;
     let released = false;
-    return { allowed: true, release: () => {
+    return { allowed: true, ...(observed ? { reason: observed } : {}), release: () => {
       if (released) return;
       released = true;
       this.concurrent -= 1;

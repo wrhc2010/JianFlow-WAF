@@ -13,7 +13,7 @@ export type Admission = {
   release: () => void;
 };
 
-type Entry = { id: number; enqueuedAt: number; resolve: (value: Admission) => void; timer: ReturnType<typeof setTimeout> };
+type Entry = { id: number; enqueuedAt: number; resolve: (value: Admission) => void; timer: ReturnType<typeof setTimeout>; cleanup: () => void };
 
 export class WaitRoom {
   private active = 0;
@@ -22,17 +22,28 @@ export class WaitRoom {
 
   constructor(private readonly options: WaitRoomOptions) {}
 
-  enter(): Admission | Promise<Admission> {
+  enter(signal?: AbortSignal): Admission | Promise<Admission> {
+    if (signal?.aborted) return this.reject("客户端已断开");
     if (!this.options.enabled || this.active < this.options.maxActive) return this.grant();
     if (this.queue.length >= this.options.maxQueue) return this.reject("等候室已满");
     return new Promise<Admission>((resolve) => {
-      const entry = { id: this.nextId++, enqueuedAt: Date.now(), resolve, timer: undefined as unknown as ReturnType<typeof setTimeout> };
+      const cancel = () => {
+        const index = this.queue.indexOf(entry);
+        if (index < 0) return;
+        this.queue.splice(index, 1);
+        clearTimeout(entry.timer);
+        entry.cleanup();
+        resolve(this.reject("客户端已断开"));
+      };
+      const entry: Entry = { id: this.nextId++, enqueuedAt: Date.now(), resolve, timer: undefined as unknown as ReturnType<typeof setTimeout>, cleanup: () => signal?.removeEventListener("abort", cancel) };
+      signal?.addEventListener("abort", cancel, { once: true });
       this.queue.push(entry);
       const timer = setTimeout(() => {
         const current = this.queue.find((item) => item.id === entry.id);
         if (!current) return;
         const actualIndex = this.queue.indexOf(current);
         if (actualIndex >= 0) this.queue.splice(actualIndex, 1);
+        entry.cleanup();
         resolve(this.reject("等候室等待超时", Math.ceil(this.options.timeoutSeconds)));
       }, this.options.timeoutSeconds * 1000);
       timer.unref?.();
@@ -61,7 +72,8 @@ export class WaitRoom {
     while (this.active < this.options.maxActive && this.queue.length) {
       const entry = this.queue.shift()!;
       clearTimeout(entry.timer);
-      entry.resolve(this.grant());
+      entry.cleanup();
+      entry.resolve({ ...this.grant(), queued: true });
     }
   }
 }

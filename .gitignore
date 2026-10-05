@@ -11,3 +11,8 @@ geoip/*.mmdb
 *.log
 certs/*.key
 certs/*.pem
+secrets/
+config/*.json
+test-results/
+playwright-report/
+apps/verification/

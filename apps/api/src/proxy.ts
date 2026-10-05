@@ -15,7 +15,9 @@ import { Store, type Site } from "./db/store.js";
 import { inspectBody } from "./body-inspection.js";
 import { TrafficControl } from "./traffic-control.js";
 import { WaitRoom } from "./wait-room.js";
-import { verifyToken } from "./captcha.js";
+import { captchaPage, createChallenge, issueToken, verifyChallenge, verifyProvider, verifyToken } from "./captcha.js";
+import { defaultPage } from "./pages.js";
+import { browserWaitResponse, repeatWaitingResponse, takeWaitingAdmission, waitStatus } from "./browser-wait-room.js";
 export { isIpInCidr } from "@jev-waf/core";
 
 const proxy = httpProxy.createProxyServer({ changeOrigin: true, xfwd: false, proxyTimeout: 30000 });
@@ -50,6 +52,9 @@ const clientControlledRoutingHeaders = [
 ];
 const controls = new WeakMap<Store, TrafficControl>();
 const waitRooms = new WeakMap<Store, Map<string, WaitRoom>>();
+type ActiveConnection = { destroy: () => void };
+const activeConnections = new WeakMap<Store, Map<string, Set<ActiveConnection>>>();
+const upstreamCursors = new WeakMap<Store, Map<string, { signature: string; current: number[] }>>();
 const builtinIds = new Set(BUILTIN_RULES.map((rule) => rule.id));
 function control(store: Store): TrafficControl {
   let value = controls.get(store);
@@ -69,6 +74,28 @@ function waitRoom(store: Store, site: Site): WaitRoom {
   return room;
 }
 export function trafficRuntime(store: Store) { return control(store).snapshot(); }
+
+function registerActive(store: Store, siteId: string, ip: string | undefined, connection: ActiveConnection): () => void {
+  if (!ip) return () => {};
+  let entries = activeConnections.get(store);
+  if (!entries) { entries = new Map(); activeConnections.set(store, entries); }
+  const key = `${siteId}\0${ip}`;
+  let connections = entries.get(key);
+  if (!connections) { connections = new Set(); entries.set(key, connections); }
+  connections.add(connection);
+  return () => {
+    connections?.delete(connection);
+    if (!connections?.size) entries?.delete(key);
+  };
+}
+
+function interruptActive(store: Store, siteId: string, ip: string): void {
+  const entries = activeConnections.get(store);
+  const connections = entries?.get(`${siteId}\0${ip}`);
+  if (!connections) return;
+  for (const connection of [...connections]) connection.destroy();
+  entries?.delete(`${siteId}\0${ip}`);
+}
 
 function headersOf(request: http.IncomingHttpHeaders): Record<string, string> {
   return Object.fromEntries(
@@ -151,6 +178,12 @@ export function clientIp(request: http.IncomingMessage, trustedCidrs = config.tr
   return current;
 }
 
+function secureRequest(request: http.IncomingMessage): boolean {
+  if ("encrypted" in request.socket && request.socket.encrypted) return true;
+  const remote = request.socket.remoteAddress?.replace(/^::ffff:/i, "");
+  return Boolean(remote && config.trustedProxyCidrs.some((cidr) => isIpInCidr(remote, cidr)) && request.headers["x-forwarded-proto"] === "https");
+}
+
 function validateRequestFraming(request: http.IncomingMessage): void {
   if (request.httpVersionMajor < 1) throw new Error("不支持 HTTP/0.9 请求");
   const contentLengths = request.headersDistinct?.["content-length"]
@@ -194,20 +227,71 @@ function runtimeBan(store: Store, siteId: string, ip: string | undefined): numbe
   if (!ip || isWhitelisted(store, ip)) return 0;
   const stored = typeof store.getRuntimeBan === "function" ? store.getRuntimeBan(siteId, ip) : undefined;
   if (stored) return Math.max(1, Math.ceil((stored.until - Date.now()) / 1000));
-  return control(store).isBanned(siteId, ip);
+  return 0;
 }
 
 function captchaRequired(store: Store, request: http.IncomingMessage, siteId: string, ip: string | undefined): boolean {
-  const captcha = store.getSettings().captcha ?? { enabled: false, provider: "local" as const };
-  if (!captcha.enabled || captcha.provider !== "local" || !ip) return false;
-  const token = typeof request.headers["x-jev-captcha-token"] === "string" ? request.headers["x-jev-captcha-token"] : undefined;
+  const captcha = captchaOptions(store, siteId);
+  if (!captcha.enabled || !ip || isWhitelisted(store, ip)) return false;
+  const token = typeof request.headers["x-jev-captcha-token"] === "string" ? request.headers["x-jev-captcha-token"] : request.headers.cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith("jf_clearance="))?.slice("jf_clearance=".length);
   return !token || !verifyToken(siteId, ip, token);
 }
 
-function pageResponse(store: Store, response: http.ServerResponse, page: Site["maintenance"] | Site["upstreamError"], status: number, title: string, requestId: string): void {
+function captchaOptions(store: Store, siteId: string) {
+  const captcha = store.getSettings().captcha ?? { enabled: false, provider: "local" as const, siteKey: "", secretConfigured: false };
+  const override = typeof store.listSites === "function" ? store.listSites().find((site) => site.id === siteId)?.captchaEnabled : null;
+  return { ...captcha, enabled: override ?? captcha.enabled };
+}
+
+function challengeResponse(store: Store, response: http.ServerResponse, requestId: string, siteId: string): void {
+  const body = captchaPage(captchaOptions(store, siteId));
+  response.writeHead(403, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-jev-request-id": requestId });
+  response.end(body);
+}
+
+const captchaWork = new WeakMap<Store, number>();
+async function handleVisitorCaptcha(store: Store, request: http.IncomingMessage, response: http.ServerResponse, siteId: string, ip: string, path: string, policy: SitePolicy): Promise<boolean> {
+  if (!path.startsWith("/.jianflow/captcha/")) return false;
+  const options = captchaOptions(store, siteId);
+  response.setHeader("cache-control", "no-store");
+  response.setHeader("content-type", "application/json; charset=utf-8");
+  if (!options.enabled) { request.resume(); response.writeHead(404); response.end("{}"); return true; }
+  if (path === "/.jianflow/captcha/challenge" && request.method === "GET" && options.provider === "local") {
+    response.end(JSON.stringify(createChallenge(siteId, ip))); return true;
+  }
+  if (path !== "/.jianflow/captcha/verify" || request.method !== "POST") { request.resume(); response.writeHead(404); response.end("{}"); return true; }
+  const active = captchaWork.get(store) ?? 0;
+  if (active >= 8) { request.resume(); response.writeHead(429); response.end("{}"); return true; }
+  captchaWork.set(store, active + 1);
+  try {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of request.iterator({ destroyOnReturn: false })) {
+      size += Buffer.byteLength(chunk);
+      if (size > 16384) { request.resume(); response.writeHead(413); response.end("{}"); return true; }
+      chunks.push(Buffer.from(chunk));
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { challenge?: unknown; answer?: unknown; response?: unknown };
+    let token: string | undefined;
+    if (options.provider === "local") token = typeof body.challenge === "string" && typeof body.answer === "string" ? verifyChallenge(siteId, ip, body.challenge, body.answer) : undefined;
+    else if (typeof body.response === "string") {
+      const hostname = new URL(`http://${request.headers.host ?? "localhost"}`).hostname;
+      const result = await verifyProvider(options, store.getCaptchaSecret(), body.response, ip, hostname);
+      if (result.allowed) token = issueToken(siteId, ip);
+    }
+    if (!token) { response.writeHead(403); response.end("{}"); return true; }
+    control(store).clearBan(siteId, ip, policy.rateLimit.burst);
+    response.setHeader("set-cookie", `jf_clearance=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600${secureRequest(request) ? "; Secure" : ""}`);
+    response.end(JSON.stringify({ ok: true }));
+  } catch { if (!response.headersSent) response.writeHead(400); response.end("{}"); }
+  finally { captchaWork.set(store, Math.max(0, (captchaWork.get(store) ?? 1) - 1)); }
+  return true;
+}
+
+function pageResponse(store: Store, response: http.ServerResponse, page: Site["maintenance"] | Site["upstreamError"], status: number, title: string, requestId: string, forceStatus = false): void {
   const configured = typeof store.readPage === "function" ? store.readPage(page) : page?.source === "inline" ? page.html : undefined;
-  const body = configured || `<!doctype html><meta charset="utf-8"><title>${title}</title><style>body{font-family:system-ui,sans-serif;background:#f2f8f4;color:#18352a;padding:10vh 8vw}main{max-width:640px;margin:auto;background:#fff;border:1px solid #cce5d6;border-radius:18px;padding:32px}h1{margin-top:0;color:#147d57}</style><main><h1>${title}</h1><p>请稍后再试。</p><small>Request ID: ${requestId}</small></main>`;
-  response.writeHead(page?.statusCode ?? status, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(body), "x-jev-request-id": requestId });
+  const body = configured || defaultPage(title, "请稍后再试。", `<small>Request ID: ${requestId}</small>`);
+  response.writeHead(forceStatus ? status : page?.statusCode ?? status, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(body), "cache-control": "no-store", "content-security-policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src data: https:; base-uri 'none'; form-action 'none'", "x-jev-request-id": requestId });
   response.end(body);
 }
 
@@ -250,10 +334,13 @@ function splitRequestTarget(request: WafRequest): void {
 }
 
 function forwardHeaders(request: http.IncomingMessage, wafRequest: WafRequest): void {
+  const secure = secureRequest(request);
   for (const header of clientControlledRoutingHeaders) delete request.headers[header];
   request.headers["x-forwarded-for"] = wafRequest.ip ?? "";
   request.headers["x-real-ip"] = wafRequest.ip ?? "";
-  request.headers["x-forwarded-proto"] = "encrypted" in request.socket && Boolean(request.socket.encrypted) ? "https" : "http";
+  request.headers["x-forwarded-proto"] = secure ? "https" : "http";
+  delete request.headers["x-jev-captcha-token"];
+  if (request.headers.cookie) request.headers.cookie = request.headers.cookie.split(";").filter((entry) => !/^\s*(jf_clearance|jf_wait)=/.test(entry)).join(";");
 }
 
 function eventSaver(store: Store, request: WafRequest, site?: Site, shadow?: () => Promise<Partial<WafDecision>> | undefined): (decision: WafDecision, status: number) => Promise<void> {
@@ -271,9 +358,20 @@ function eventSaver(store: Store, request: WafRequest, site?: Site, shadow?: () 
 }
 
 const responseFailures = new WeakMap<http.IncomingMessage, (reason: string) => void>();
-proxy.on("proxyRes", (upstream, request) => {
+const upstreamResources = new WeakMap<http.IncomingMessage, Set<http.ClientRequest | http.IncomingMessage>>();
+const receivedUpstreamHeaders = new WeakSet<http.IncomingMessage>();
+const upstreamResponses = new WeakMap<http.IncomingMessage, (upstream: http.IncomingMessage) => void>();
+proxy.on("proxyReq", (outgoing, request, response) => {
+  if (response.destroyed) outgoing.destroy();
+  else upstreamResources.get(request)?.add(outgoing);
+});
+proxy.on("proxyRes", (upstream, request, response) => {
+  receivedUpstreamHeaders.add(request);
+  if (response.destroyed) upstream.destroy();
+  else upstreamResources.get(request)?.add(upstream);
   upstream.once("aborted", () => responseFailures.get(request)?.("上游响应传输中断"));
   upstream.once("error", () => responseFailures.get(request)?.("上游响应传输失败"));
+  upstreamResponses.get(request)?.(upstream);
 });
 
 function settingsForPort(store: Store, listenPort?: number) {
@@ -283,6 +381,30 @@ function settingsForPort(store: Store, listenPort?: number) {
   if (!site || !site.enabled) return undefined;
   const policy = store.effectivePolicy?.(site) ?? { ...defaultPolicy(), strength: settings.strength, customThreshold: settings.customThreshold };
   return { settings: { ...settings, mode: site.mode, upstreamUrl: site.upstreamUrl, strength: policy.strength, customThreshold: policy.customThreshold }, policy, site };
+}
+
+function upstreamTargets(store: Store, site: Site | undefined, fallback: string): string[] {
+  const pool = site?.upstreamPool?.filter((entry) => entry.url) ?? [];
+  if (!pool.length) return [fallback];
+  const key = site?.id ?? "default";
+  const cursors = upstreamCursors.get(store) ?? new Map<string, { signature: string; current: number[] }>();
+  upstreamCursors.set(store, cursors);
+  const signature = JSON.stringify(pool);
+  let cursor = cursors.get(key);
+  if (!cursor || cursor.signature !== signature) {
+    cursor = { signature, current: pool.map(() => 0) };
+    cursors.set(key, cursor);
+  }
+  let selected = 0;
+  let total = 0;
+  for (let index = 0; index < pool.length; index++) {
+    const weight = pool[index]!.weight ?? 1;
+    total += weight;
+    cursor.current[index] = cursor.current[index]! + weight;
+    if (cursor.current[index]! > cursor.current[selected]!) selected = index;
+  }
+  cursor.current[selected] = cursor.current[selected]! - total;
+  return [pool[selected]!.url, ...pool.filter((_, index) => index !== selected).map((entry) => entry.url)];
 }
 
 function accessDecision(store: Store, request: WafRequest, mode: WafDecision["mode"], requestId: string): { decision?: WafDecision; skip: boolean } {
@@ -307,6 +429,11 @@ async function inspectRequest(store: Store, request: WafRequest, resolved: NonNu
   if (skip) return { decision: { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "访问控制：跳过检测", module: "acl", localInspectionComplete: false } as WafDecision };
   const exceptions = (store.listScopedRules?.(site?.id ?? "", "exceptions") ?? []) as RuleException[];
   const profile = typeof store.getAiProvider === "function" ? await store.getAiProvider(site?.aiProfileId) : undefined;
+  if (profile?.profile.failureAction && profile.profile.failureAction !== "inherit") policy.aiFailureAction = profile.profile.failureAction;
+  if (!profile && typeof store.getAiProvider === "function" && settings.mode !== "traditional") {
+    const localDecision = await evaluateRequest(request, store.listRules(), { ...settings, mode: "traditional" }, requestId, () => Promise.reject(), { policy, exceptions });
+    return { decision: localDecision };
+  }
   const effectiveSettings = profile ? { ...settings, model: profile.profile.model, aiTimeoutMs: profile.profile.timeoutMs } : settings;
   const classify = (state: string, model: string, timeout: number) => classifyWithJev(
     state,
@@ -315,6 +442,10 @@ async function inspectRequest(store: Store, request: WafRequest, resolved: NonNu
     site?.id,
     profile?.provider
   );
+  if ((site?.auditMode ?? settings.auditMode) === "async" && effectiveSettings.mode !== "traditional") {
+    const localDecision = await evaluateRequest(request, store.listRules(), { ...effectiveSettings, mode: "traditional" }, requestId, classify, { policy, exceptions });
+    return { decision: { ...localDecision, mode: effectiveSettings.mode } };
+  }
   if (policy.aiBehavior !== "shadow" || effectiveSettings.mode === "traditional") return {
     decision: await evaluateRequest(request, store.listRules(), effectiveSettings, requestId, classify, { policy, exceptions })
   };
@@ -340,30 +471,37 @@ function scheduleAsyncAudit(
   decision: WafDecision,
   requestId: string
 ): void {
-  if (store.getSettings().auditMode !== "async" || !request.ip || isWhitelisted(store, request.ip)) return;
   const { settings, policy, site } = resolved;
-  if (!site || !policy.aiScope || policy.aiBehavior === "shadow" || settings.mode === "traditional") return;
+  if ((site?.auditMode ?? settings.auditMode) !== "async" || !request.ip) return;
+  if (!site || policy.aiBehavior === "shadow" || settings.mode === "traditional" || decision.module === "acl") return;
+  if (policy.aiScope === "suspicious" && !decision.matchedRules.length) return;
   const profilePromise = typeof store.getAiProvider === "function" ? store.getAiProvider(site.aiProfileId) : Promise.resolve(undefined);
   void profilePromise.then(async (profile) => {
+    if (!profile && typeof store.getAiProvider === "function") return;
     const inspection = buildAiInspection(request, settings.aiBodyLimit, policy.aiBodyFields);
     const provider = profile?.provider;
     const ai = await classifyWithJev(inspection.state, profile?.profile.model ?? settings.model, profile?.profile.timeoutMs ?? settings.aiTimeoutMs, site.id, provider);
-    if (!ai.available || ai.noul < thresholdFor(settings)) return;
+    const malicious = ai.available && ai.noul >= thresholdFor(settings);
+    const failureAction = profile?.profile.failureAction === "allow" || profile?.profile.failureAction === "block" ? profile.profile.failureAction : policy.aiFailureAction;
+    const failClosed = !ai.available && (failureAction === "block" || failureAction === "inherit" && settings.mode === "ai");
     const current = store.getSettings();
-    const base = current.asyncBanBaseSeconds;
-    const increment = current.asyncBanIncrementSeconds;
-    const max = current.asyncBanMaxSeconds;
-    const stored = typeof store.recordRuntimeBan === "function"
-      ? store.recordRuntimeBan(site.id, request.ip!, base, increment, max)
-      : undefined;
-    const seconds = stored?.seconds ?? Math.min(max, base + (control(store).isBanned(site.id, request.ip!) > 0 ? increment : 0));
-    if (!stored) control(store).ban(site.id, request.ip!, seconds);
+    let seconds = 0;
+    if (malicious && site.operationMode !== "record" && policy.enforcement !== "observe" && !isWhitelisted(store, request.ip)) {
+      const stored = typeof store.recordRuntimeBan === "function"
+        ? await store.recordRuntimeBan(site.id, request.ip!, current.asyncBanBaseSeconds, current.asyncBanIncrementSeconds, current.asyncBanMaxSeconds)
+        : undefined;
+      seconds = stored?.seconds ?? current.asyncBanBaseSeconds;
+      if (!stored) control(store).ban(site.id, request.ip!, seconds);
+      if (!isWhitelisted(store, request.ip)) interruptActive(store, site.id, request.ip!);
+    }
+    if (failClosed && site.operationMode !== "record" && policy.enforcement !== "observe" && !isWhitelisted(store, request.ip)) interruptActive(store, site.id, request.ip!);
     const followup: WafDecision = {
-      action: "block", mode: settings.mode, requestId: `${requestId}:async`, matchedRules: [],
-      reason: `异步审核判定恶意，已封禁 ${seconds} 秒`, module: "async-ai", ai, score: ai.noul,
+      action: seconds ? "block" : ai.available ? "allow" : "error", mode: settings.mode, requestId: `${requestId}:async`, matchedRules: [],
+      reason: seconds ? `异步审核判定恶意，已封禁 ${seconds} 秒` : malicious ? "异步审核命中，仅记录" : ai.available ? "异步审核通过" : failClosed ? "异步审核不可用，已中断活动流量（不追封）" : "异步审核不可用，已记录",
+      ...(malicious && !seconds ? { wouldBlock: true } : {}), module: "async-ai", ai, ...(ai.available ? { score: ai.noul } : {}),
       threshold: thresholdFor(settings), aiInspectionComplete: inspection.complete, partialInspection: !inspection.complete
     };
-    await store.saveEvent(followup, { method: request.method, path: `${request.path}${request.query}`, ip: request.ip, siteId: site.id, listenPort: site.listenPort, policyRevision: site.revision ?? 1 }, 403);
+    await store.saveEvent(followup, { method: request.method, path: `${request.path}${request.query}`, ip: request.ip, siteId: site.id, listenPort: site.listenPort, policyRevision: site.revision ?? 1 }, seconds ? 403 : ai.available ? 200 : 503);
   }).catch(() => undefined);
 }
 
@@ -377,15 +515,28 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
   let shadow: Promise<Partial<WafDecision>> | undefined;
   const saveOnce = eventSaver(store, wafRequest, site, () => shadow);
   let release = () => {};
+  const abort = new AbortController();
+  const unregisterActive = registerActive(store, site?.id ?? "default", wafRequest.ip, { destroy: () => {
+    abort.abort();
+    for (const resource of upstreamResources.get(request) ?? []) resource.destroy();
+    response.destroy();
+    request.destroy();
+  } });
   let decision = inspectionFailure(settings.mode, requestId, "请求尚未完成检查");
   response.once("finish", () => {
     release();
+    unregisterActive();
+    upstreamResources.delete(request);
     const status = response.statusCode || 502;
     if (status >= 500 && decision.action === "allow") decision = { ...decision, action: "error", reason: `上游返回 HTTP ${status}` };
     void saveOnce(decision, status);
   });
   response.once("close", () => {
+    abort.abort();
     release();
+    unregisterActive();
+    for (const resource of upstreamResources.get(request) ?? []) resource.destroy();
+    upstreamResources.delete(request);
     if (!response.writableFinished) void saveOnce({ ...decision, action: "error", reason: "响应传输中断" }, 499);
   });
   request.setTimeout(15000, () => {
@@ -397,48 +548,54 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
   try {
     validateRequestFraming(request);
     splitRequestTarget(wafRequest);
+    if (site?.operationMode === "maintenance") {
+      decision = { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "维护模式", module: "maintenance", localInspectionComplete: true };
+      request.resume(); pageResponse(store, response, site.maintenance, 503, "站点维护中", requestId);
+      await saveOnce(decision, site.maintenance?.statusCode ?? 503); return;
+    }
+    if (wafRequest.path === "/.jianflow/wait/status" && wafRequest.ip && site && request.method === "GET") { waitStatus(store, request, response, site.id, wafRequest.ip); return; }
+    if (wafRequest.ip && await handleVisitorCaptcha(store, request, response, site?.id ?? "default", wafRequest.ip, wafRequest.path, policy)) return;
     const access = accessDecision(store, wafRequest, settings.mode, requestId);
-    if (access.decision) { decision = access.decision; request.resume(); blockResponse(response, 403, decision.reason, requestId); return; }
+    if (access.decision && site?.operationMode !== "record") { decision = access.decision; request.resume(); blockResponse(response, 403, decision.reason, requestId); return; }
     const activeBan = runtimeBan(store, site?.id ?? "default", wafRequest.ip);
-    if (activeBan && !isWhitelisted(store, wafRequest.ip)) {
+    if (activeBan && site?.operationMode !== "record" && !isWhitelisted(store, wafRequest.ip)) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "来源 IP 暂时封禁", module: "async-ai", localInspectionComplete: true };
       request.resume(); response.setHeader("retry-after", activeBan); blockResponse(response, 403, decision.reason, requestId); return;
     }
-    if (captchaRequired(store, request, site?.id ?? "default", wafRequest.ip)) {
+    if (settings.captcha?.trigger !== "cc" && site?.operationMode !== "record" && captchaRequired(store, request, site?.id ?? "default", wafRequest.ip)) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "需要完成人机验证", module: "captcha", localInspectionComplete: true };
-      request.resume(); blockResponse(response, 403, decision.reason, requestId); return;
+      request.resume(); challengeResponse(store, response, requestId, site?.id ?? "default"); return;
     }
-    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy);
+    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy, Date.now(), { whitelisted: isWhitelisted(store, wafRequest.ip), observe: site?.operationMode === "record" || policy.enforcement === "observe" });
     release = admission.release;
     if (!admission.allowed) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: admission.reason ?? "限速", module: "cc", localInspectionComplete: false };
       request.resume(); response.setHeader("retry-after", admission.retryAfter ?? 1);
+      if (settings.captcha?.trigger === "cc" && !["global_concurrency", "tracked_client_limit"].includes(admission.reason ?? "") && captchaRequired(store, request, site?.id ?? "default", wafRequest.ip)) { challengeResponse(store, response, requestId, site?.id ?? "default"); return; }
       blockResponse(response, 429, decision.reason, requestId); return;
     }
-    if (site?.operationMode === "maintenance") {
-      decision = { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "维护模式", module: "maintenance", localInspectionComplete: true };
-      request.resume();
-      pageResponse(store, response, site.maintenance, 503, "站点维护中", requestId);
-      await saveOnce(decision, site.maintenance?.statusCode ?? 503);
+    request.setTimeout(0);
+    const browser = Boolean(site && wafRequest.ip && request.method === "GET" && request.headers.accept?.includes("text/html"));
+    if (browser && repeatWaitingResponse(store, request, response, site!, wafRequest.ip!)) return;
+    const browserAbort = browser ? new AbortController() : abort;
+    const entered = site ? takeWaitingAdmission(store, request, site.id, wafRequest.ip ?? "") ?? waitRoom(store, site).enter(browserAbort.signal) : { allowed: true, queued: false, release: () => {} };
+    if (browser && entered instanceof Promise) {
+      decision = { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "已进入 FIFO 等候室", module: "wait-room", localInspectionComplete: false };
+      browserWaitResponse(store, request, response, site!, wafRequest.ip!, entered, browserAbort, (destroy) => registerActive(store, site!.id, wafRequest.ip, { destroy }));
       return;
     }
-    if (site?.redirect) {
-      decision = { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "站点跳转", module: "redirect", localInspectionComplete: true };
-      request.resume();
-      response.writeHead(site.redirect.statusCode, { location: site.redirect.location, "x-jev-request-id": requestId });
-      response.end();
-      await saveOnce(decision, site.redirect.statusCode);
-      return;
-    }
-    const roomAdmission = site ? await waitRoom(store, site).enter() : { allowed: true, queued: false, release: () => {} };
+    const roomAdmission = await entered;
+    if (response.destroyed || abort.signal.aborted) { roomAdmission.release(); return; }
     if (!roomAdmission.allowed) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: roomAdmission.reason ?? "等候室拒绝", module: "wait-room", localInspectionComplete: false };
       request.resume(); response.setHeader("retry-after", roomAdmission.retryAfter ?? 1);
-      blockResponse(response, 429, decision.reason, requestId); return;
+      const status = site?.waitRoom?.fullAction === "unavailable" ? 503 : 429;
+      pageResponse(store, response, site?.waitRoom?.page, status, decision.reason, requestId, true); return;
     }
     const roomRelease = roomAdmission.release;
     const previousRelease = release;
     release = () => { previousRelease(); roomRelease(); };
+    request.setTimeout(15000);
     const body = await readBody(request);
     request.setTimeout(0);
     if (response.destroyed) return;
@@ -450,31 +607,65 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
       decision = result.decision;
       shadow = result.shadow;
     }
+    if (!body.error && access.decision) decision = access.decision;
+    if (admission.reason && decision.action === "allow") decision = { ...decision, wouldBlock: true, module: "cc", reason: `观察限速：${admission.reason}` };
     decision.partialInspection = body.partial || Boolean(decision.partialInspection);
     if (response.destroyed) return;
-    if (decision.action !== "allow" && site?.operationMode !== "record") {
+    if (decision.action !== "allow" && (body.error || site?.operationMode !== "record")) {
       const status = decision.action === "block" ? 403 : body.error ? body.error.includes("超过") ? 413 : 400 : decision.partialInspection ? 413 : 503;
       blockResponse(response, status, decision.reason, requestId);
       await saveOnce(decision, status);
       return;
     }
     if (decision.action !== "allow" && site?.operationMode === "record") decision = { ...decision, action: "allow", wouldBlock: true, reason: `记录模式：${decision.reason}` };
+    if (site?.redirect) {
+      response.writeHead(site.redirect.statusCode, { location: site.redirect.location, "x-jev-request-id": requestId }); response.end();
+      await saveOnce({ ...decision, ...(!decision.wouldBlock ? { module: "redirect" } : {}) }, site.redirect.statusCode); return;
+    }
     scheduleAsyncAudit(store, wafRequest, resolved, decision, requestId);
     forwardHeaders(request, wafRequest);
     response.setHeader("x-jev-request-id", requestId);
+    upstreamResources.set(request, new Set());
+    upstreamResponses.set(request, (upstream) => {
+      if (response.destroyed) { upstream.destroy(); return; }
+      if ((upstream.statusCode ?? 502) >= 500 && site) {
+        decision = { ...decision, action: "error", reason: `上游返回 HTTP ${upstream.statusCode}` };
+        pageResponse(store, response, site.upstreamError, 502, "上游暂不可用", requestId);
+        upstream.resume(); return;
+      }
+      for (const [name, value] of Object.entries(upstream.headers)) {
+        if (value !== undefined && !["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "upgrade", "x-jev-request-id"].includes(name)) response.setHeader(name, value);
+      }
+      response.writeHead(upstream.statusCode ?? 502);
+      upstream.pipe(response);
+    });
     responseFailures.set(request, (reason) => {
       decision = { ...decision, action: "error", reason };
       void saveOnce(decision, 502);
       response.destroy();
     });
-    const stream = new PassThrough();
-    stream.end(body.forwardBody);
-    proxy.web(request, response, { target: settings.upstreamUrl, buffer: stream }, () => {
-      decision = { ...decision, action: "error", reason: "上游连接失败" };
-      if (!response.headersSent) pageResponse(store, response, site?.upstreamError, 502, "上游暂不可用", requestId);
-      else response.destroy();
-      void saveOnce(decision, 502);
-    });
+    const targets = upstreamTargets(store, site, settings.upstreamUrl);
+    const tryTarget = (index: number): void => {
+      const stream = new PassThrough();
+      stream.end(body.forwardBody);
+      let failed = false;
+      proxy.web(request, response, { target: targets[index]!, buffer: stream, selfHandleResponse: true }, () => {
+        if (failed || response.destroyed) return;
+        failed = true;
+        // Never replay a state-changing request after an ambiguous upstream failure.
+        if (index + 1 < targets.length && ["GET", "HEAD", "OPTIONS"].includes(wafRequest.method)
+          && !receivedUpstreamHeaders.has(request) && !response.headersSent) {
+          stream.destroy();
+          tryTarget(index + 1);
+          return;
+        }
+        decision = { ...decision, action: "error", reason: "上游连接失败" };
+        if (!response.headersSent) pageResponse(store, response, site?.upstreamError, 502, "上游暂不可用", requestId);
+        else response.destroy();
+        void saveOnce(decision, 502);
+      });
+    };
+    tryTarget(0);
   } catch (error) {
     decision = inspectionFailure(settings.mode, requestId, error instanceof Error ? error.message : "检测异常");
     if (!response.headersSent && !response.destroyed) blockResponse(response, 400, decision.reason, requestId);
@@ -493,10 +684,17 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
   let shadow: Promise<Partial<WafDecision>> | undefined;
   const saveOnce = eventSaver(store, wafRequest, site, () => shadow);
   let release = () => {};
+  const abort = new AbortController();
+  let outgoing: http.ClientRequest | undefined;
+  const unregisterActive = registerActive(store, site?.id ?? "default", wafRequest.ip, { destroy: () => {
+    abort.abort(); socket.destroy(); outgoing?.destroy();
+  } });
   let decision = inspectionFailure(settings.mode, requestId, "WebSocket 握手尚未完成");
   let upgraded = false;
   socket.once("close", () => {
+    abort.abort();
     release();
+    unregisterActive();
     if (!upgraded) void saveOnce({ ...decision, action: "error", reason: "WebSocket 握手中断" }, 499);
   });
   try {
@@ -506,20 +704,35 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
       throw new Error("WebSocket 握手格式无效");
     }
     validateRequestFraming(request);
+    if (site?.operationMode === "maintenance") {
+      decision = { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "维护模式", module: "maintenance" };
+      await saveOnce(decision, site.maintenance?.statusCode ?? 503);
+      upgradeBlock(socket, site.maintenance?.statusCode ?? 503, requestId); return;
+    }
     const access = accessDecision(store, wafRequest, settings.mode, requestId);
-    if (access.decision) { decision = access.decision; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
+    if (access.decision && site?.operationMode !== "record") { decision = access.decision; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
     const activeBan = runtimeBan(store, site?.id ?? "default", wafRequest.ip);
-    if (activeBan && !isWhitelisted(store, wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "来源 IP 暂时封禁", module: "async-ai" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId, activeBan); return; }
-    if (captchaRequired(store, request, site?.id ?? "default", wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "需要完成人机验证", module: "captcha" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
-    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy);
+    if (activeBan && site?.operationMode !== "record" && !isWhitelisted(store, wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "来源 IP 暂时封禁", module: "async-ai" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId, activeBan); return; }
+    if (settings.captcha?.trigger !== "cc" && site?.operationMode !== "record" && captchaRequired(store, request, site?.id ?? "default", wafRequest.ip)) { decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: "需要完成人机验证", module: "captcha" }; await saveOnce(decision, 403); upgradeBlock(socket, 403, requestId); return; }
+    const admission = control(store).enter(site?.id ?? "default", wafRequest.ip ?? "unknown", wafRequest.path, policy, Date.now(), { whitelisted: isWhitelisted(store, wafRequest.ip), observe: site?.operationMode === "record" || policy.enforcement === "observe" });
     release = admission.release;
     if (!admission.allowed) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: admission.reason ?? "限速", module: "cc" };
       await saveOnce(decision, 429); upgradeBlock(socket, 429, requestId, admission.retryAfter ?? 1); return;
     }
+    const roomAdmission = site ? await waitRoom(store, site).enter(abort.signal) : { allowed: true, release: () => {}, reason: undefined, retryAfter: undefined };
+    if (socket.destroyed) { roomAdmission.release(); return; }
+    if (!roomAdmission.allowed) {
+      decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: roomAdmission.reason ?? "等候室拒绝", module: "wait-room" };
+      const status = site?.waitRoom?.fullAction === "unavailable" ? 503 : 429;
+      await saveOnce(decision, status); upgradeBlock(socket, status, requestId, roomAdmission.retryAfter); return;
+    }
+    const ccRelease = release; release = () => { ccRelease(); roomAdmission.release(); };
     const result = await inspectRequest(store, wafRequest, resolved, requestId, access.skip);
-    decision = result.decision;
+    decision = access.decision ?? result.decision;
     shadow = result.shadow;
+    if (admission.reason && decision.action === "allow") decision = { ...decision, wouldBlock: true, module: "cc", reason: `观察限速：${admission.reason}` };
+    if (decision.action !== "allow" && site?.operationMode === "record") decision = { ...decision, action: "allow", wouldBlock: true, reason: `记录模式：${decision.reason}` };
     if (socket.destroyed) return;
     if (decision.action !== "allow") {
       const status = decision.action === "block" ? 403 : 503;
@@ -527,20 +740,24 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
       upgradeBlock(socket, status, requestId);
       return;
     }
+    if (site?.redirect) {
+      await saveOnce(decision, site.redirect.statusCode);
+      socket.end(`HTTP/1.1 ${site.redirect.statusCode} Redirect\r\nConnection: close\r\nContent-Length: 0\r\nLocation: ${site.redirect.location}\r\nX-Jev-Request-Id: ${requestId}\r\n\r\n`); return;
+    }
     scheduleAsyncAudit(store, wafRequest, resolved, decision, requestId);
     forwardHeaders(request, wafRequest);
-    const target = new URL(settings.upstreamUrl);
+    const target = new URL(upstreamTargets(store, site, settings.upstreamUrl)[0]!);
     const transport = target.protocol === "https:" ? https : http;
     const path = `${target.pathname.replace(/\/$/, "")}${request.url}`;
-    const outgoing = transport.request(target, { method: "GET", path, headers: { ...request.headers, host: target.host } });
+    outgoing = transport.request(target, { method: "GET", path, headers: { ...request.headers, host: target.host } });
     const fail = (): void => {
       decision = { ...decision, action: "error", reason: "WebSocket 上游连接失败" };
       void saveOnce(decision, 502);
       if (!socket.destroyed) upgradeBlock(socket, 502, requestId);
     };
     outgoing.on("error", fail);
-    outgoing.setTimeout(30000, () => outgoing.destroy(new Error("upstream timeout")));
-    socket.once("close", () => { if (!upgraded) outgoing.destroy(); });
+    outgoing.setTimeout(30000, () => outgoing?.destroy(new Error("upstream timeout")));
+    socket.once("close", () => { if (!upgraded) outgoing?.destroy(); });
     outgoing.on("response", (upstream) => {
       decision = { ...decision, action: "error", reason: `上游拒绝 WebSocket 握手: HTTP ${upstream.statusCode}` };
       void saveOnce(decision, upstream.statusCode ?? 502);
@@ -555,7 +772,7 @@ async function handleUpgrade(store: Store, request: http.IncomingMessage, socket
     });
     outgoing.on("upgrade", (upstream, upstreamSocket, upstreamHead) => {
       upgraded = true;
-      outgoing.setTimeout(0);
+      outgoing!.setTimeout(0);
       void saveOnce(decision, 101);
       socket.write("HTTP/1.1 101 Switching Protocols\r\n"
         + Object.entries({ ...upstream.headers, "x-jev-request-id": requestId })

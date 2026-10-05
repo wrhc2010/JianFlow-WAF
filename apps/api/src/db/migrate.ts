@@ -83,6 +83,23 @@ ALTER TABLE sites ADD COLUMN IF NOT EXISTS wait_room JSONB NOT NULL DEFAULT '{"e
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS maintenance JSONB NOT NULL DEFAULT '{"source":"default","statusCode":503}'::jsonb;
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS upstream_error JSONB NOT NULL DEFAULT '{"source":"default","statusCode":502}'::jsonb;
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS redirect JSONB;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS upstream_pool JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS audit_mode TEXT;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS captcha_enabled BOOLEAN;
+CREATE TABLE IF NOT EXISTS runtime_bans (
+  site_id TEXT NOT NULL,
+  ip TEXT NOT NULL,
+  until_ms BIGINT NOT NULL,
+  seconds INTEGER NOT NULL,
+  count INTEGER NOT NULL,
+  PRIMARY KEY(site_id,ip)
+);
+CREATE TABLE IF NOT EXISTS nginx_imports (
+  id TEXT PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL,
+  digest TEXT NOT NULL,
+  ports JSONB NOT NULL
+);
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS api_key_ciphertext TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_salt TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_hash TEXT;
@@ -106,6 +123,7 @@ ALTER TABLE settings ADD COLUMN IF NOT EXISTS whitelist_cidrs JSONB NOT NULL DEF
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS malicious_ip_cidrs JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS wait_room_defaults JSONB NOT NULL DEFAULT '{"enabled":false,"maxActive":100,"maxQueue":100,"timeoutSeconds":60}'::jsonb;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS captcha JSONB NOT NULL DEFAULT '{"enabled":false,"provider":"local","siteKey":"","secretConfigured":false}'::jsonb;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS captcha_secret_ciphertext TEXT;
 CREATE TABLE IF NOT EXISTS ai_profiles (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -118,6 +136,7 @@ CREATE TABLE IF NOT EXISTS ai_profiles (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE ai_profiles ADD COLUMN IF NOT EXISTS failure_action TEXT NOT NULL DEFAULT 'inherit';
 ALTER TABLE events ADD COLUMN IF NOT EXISTS site_id TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS context JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE TABLE IF NOT EXISTS scoped_rules (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, kind TEXT NOT NULL, value JSONB NOT NULL);

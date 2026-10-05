@@ -73,8 +73,11 @@ export class ProxyListenerManager {
 
   private async closeListener(server: http.Server): Promise<void> {
     const closing = closeServer(server);
-    for (const socket of this.connections.get(server) ?? []) socket.destroy();
+    const connections = [...this.connections.get(server) ?? []];
+    const closed = connections.filter((socket) => !socket.closed).map((socket) => new Promise<void>((resolve) => socket.once("close", resolve)));
+    for (const socket of connections) socket.destroy();
     await closing;
+    await Promise.all(closed);
   }
 }
 

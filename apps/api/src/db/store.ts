@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve, relative, sep } from "node:path";
 import { Pool, type QueryResultRow } from "pg";
 import {
   BUILTIN_RULES,
@@ -21,6 +19,8 @@ import { LocalDatabase, type LocalState } from "./local.js";
 import { ConflictError, SetupConflictError, ValidationError } from "../errors.js";
 import { MAX_TOTAL_RULES, validateRule } from "../rule-import.js";
 import { parsePolicy, parseScopedRule } from "../policy-validation.js";
+import { readStaticPage, validateHtml } from "../pages.js";
+import { validIpEntry } from "../threat-feed.js";
 
 export type RuntimeStatus = {
   state: "pending" | "active" | "disabled" | "error";
@@ -32,6 +32,7 @@ export type Site = {
   name: string;
   listenPort: number;
   upstreamUrl: string;
+  upstreamPool?: Array<{ url: string; weight?: number }>;
   redirect?: { statusCode: 301 | 302; location: string } | null;
   mode: ProtectionMode;
   enabled: boolean;
@@ -40,6 +41,8 @@ export type Site = {
   revision?: number;
   operationMode?: "defense" | "record" | "maintenance";
   aiProfileId?: string | null;
+  auditMode?: "sync" | "async" | null;
+  captchaEnabled?: boolean | null;
   waitRoom?: WaitRoomConfig;
   maintenance?: PageConfig;
   upstreamError?: PageConfig;
@@ -51,6 +54,8 @@ export type WaitRoomConfig = {
   maxActive: number;
   maxQueue: number;
   timeoutSeconds: number;
+  page?: PageConfig;
+  fullAction?: "reject" | "unavailable";
 };
 
 export type PageConfig = {
@@ -61,6 +66,7 @@ export type PageConfig = {
 };
 
 export type RuntimeBan = { siteId: string; ip: string; until: number; seconds: number; count: number };
+export type NginxImportRecord = { id: string; createdAt: string; digest: string; ports: number[] };
 
 export type AiProfile = {
   id: string;
@@ -70,6 +76,7 @@ export type AiProfile = {
   enabled: boolean;
   priority: number;
   timeoutMs: number;
+  failureAction?: "inherit" | "allow" | "block";
   apiKeyConfigured: boolean;
 };
 
@@ -106,6 +113,8 @@ export type EventRecord = {
   exceptionIds?: string[];
 };
 
+export type CaptchaConfig = { enabled: boolean; provider: "local" | "turnstile" | "hcaptcha" | "recaptcha"; siteKey: string; secretConfigured: boolean; timeoutMs?: number; failureAction?: "allow" | "block"; trigger?: "always" | "cc" };
+
 export type AppSettings = EvaluationSettings & {
   upstreamUrl: string;
   jevBaseUrl: string;
@@ -119,7 +128,7 @@ export type AppSettings = EvaluationSettings & {
   whitelistCidrs: string[];
   maliciousIpCidrs: string[];
   waitRoomDefaults: WaitRoomConfig;
-  captcha: { enabled: boolean; provider: "local" | "turnstile" | "hcaptcha" | "recaptcha"; siteKey: string; secretConfigured: boolean };
+  captcha: CaptchaConfig;
 };
 
 export type EventFilters = {
@@ -141,8 +150,9 @@ export type TimeSeriesPoint = {
   errors: number;
 };
 
-type SettingsUpdate = Partial<Omit<AppSettings, "apiKeyConfigured" | "apiKeySource">> & {
+type SettingsUpdate = Partial<Omit<AppSettings, "apiKeyConfigured" | "apiKeySource" | "captcha">> & {
   apiKey?: string | null;
+  captcha?: CaptchaConfig & { secret?: string | null };
 };
 
 export type AiProfileInput = {
@@ -154,6 +164,7 @@ export type AiProfileInput = {
   enabled?: boolean;
   priority?: number;
   timeoutMs?: number;
+  failureAction?: "inherit" | "allow" | "block";
 };
 
 function defaultSettings(): AppSettings {
@@ -176,7 +187,7 @@ function defaultSettings(): AppSettings {
   whitelistCidrs: [],
   maliciousIpCidrs: [],
   waitRoomDefaults: { enabled: false, maxActive: 100, maxQueue: 100, timeoutSeconds: 60 },
-  captcha: { enabled: false, provider: "local", siteKey: "", secretConfigured: false }
+  captcha: { enabled: config.captchaEnabled, provider: ["turnstile", "hcaptcha", "recaptcha"].includes(config.captchaProvider) ? config.captchaProvider as CaptchaConfig["provider"] : "local", siteKey: config.captchaSiteKey, secretConfigured: Boolean(config.captchaSecret), timeoutMs: config.captchaTimeoutMs, failureAction: config.captchaFailureAction, trigger: "always" }
   };
 }
 
@@ -212,12 +223,15 @@ export class Store {
   private retentionWork: Promise<number> | undefined;
   private credential: { salt: string; hash: string } | undefined;
   private apiKeyCiphertext: string | null = null;
+  private captchaSecretCiphertext: string | null = null;
   private aiProfiles = new Map<string, AiProfile & { apiKeyCiphertext?: string | null }>();
   private setupInProgress = false;
   private mutationQueue: Promise<unknown> = Promise.resolve();
   private builtinRuleIds = new Set<string>();
   private siteChangeListener: (() => void | Promise<void>) | undefined;
   private readonly runtimeBans = new Map<string, RuntimeBan>();
+  private lastBanSweep = 0;
+  private nginxImports: NginxImportRecord[] = [];
 
   constructor() {
     this.pool = config.databaseUrl ? new Pool({ connectionString: config.databaseUrl }) : null;
@@ -227,6 +241,8 @@ export class Store {
       name: "默认站点",
       listenPort: config.proxyPort,
       upstreamUrl: this.settings.upstreamUrl,
+      upstreamPool: [],
+      auditMode: null,
       redirect: null,
       mode: this.settings.mode,
       enabled: true,
@@ -246,8 +262,11 @@ export class Store {
         this.initialized = Boolean(state.initialized && state.credential);
         this.credential = state.credential;
         this.apiKeyCiphertext = state.apiKeyCiphertext;
+        this.captchaSecretCiphertext = state.captchaSecretCiphertext ?? null;
+        this.nginxImports = (state.nginxImports ?? []).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(-100);
         this.aiProfiles.clear();
         for (const profile of state.aiProfiles ?? []) this.aiProfiles.set(profile.id, profile);
+        this.local!.migrateRuntimeBans(state.runtimeBans ?? []);
         this.rules = state.rules;
         this.builtinRuleIds = new Set(state.builtinRuleIds ?? state.rules.map((rule) => rule.id));
         this.sites.clear();
@@ -256,6 +275,7 @@ export class Store {
         this.credential = makeAdminCredential(config.adminPassword);
       }
       if (this.credential) loadAdminCredential(this.credential.salt, this.credential.hash);
+      for (const ban of this.local!.activeRuntimeBans(Date.now())) this.runtimeBans.set(`${ban.siteId}\0${ban.ip}`, ban);
       const known = new Set(this.rules.map((rule) => rule.id));
       for (const rule of BUILTIN_RULES) {
         if (!known.has(rule.id) && !this.builtinRuleIds.has(rule.id)) this.rules.push(withRuleMetadata(rule));
@@ -276,6 +296,8 @@ export class Store {
           name: "默认站点",
           listenPort: config.proxyPort,
           upstreamUrl: this.settings.upstreamUrl,
+          upstreamPool: [],
+          auditMode: null,
           mode: this.settings.mode,
           enabled: true,
           createdAt: new Date().toISOString()
@@ -291,18 +313,18 @@ export class Store {
     await migrate();
     await this.pool.query(
       `INSERT INTO settings (upstream_url, jev_base_url, initialized, mode, strength,
-       custom_threshold, model, ai_timeout_ms, ai_body_limit)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       custom_threshold, model, ai_timeout_ms, ai_body_limit, captcha)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
        ON CONFLICT (id) DO NOTHING`,
       [this.settings.upstreamUrl, this.settings.jevBaseUrl, this.initialized, this.settings.mode, this.settings.strength,
-        this.settings.customThreshold, this.settings.model, this.settings.aiTimeoutMs, this.settings.aiBodyLimit]
+        this.settings.customThreshold, this.settings.model, this.settings.aiTimeoutMs, this.settings.aiBodyLimit, JSON.stringify(this.settings.captcha)]
     );
     const settingResult = await this.pool.query(
       `SELECT mode, strength, custom_threshold, model, jev_base_url,
               api_key_ciphertext, admin_password_salt, admin_password_hash,
               initialized, ai_timeout_ms, ai_body_limit, upstream_url, default_policy,
               audit_mode, async_ban_base_seconds, async_ban_increment_seconds, async_ban_max_seconds,
-              whitelist_cidrs, malicious_ip_cidrs, wait_room_defaults, captcha
+              whitelist_cidrs, malicious_ip_cidrs, wait_room_defaults, captcha, captcha_secret_ciphertext
        FROM settings WHERE id = 1`
     );
     const row = settingResult.rows[0] as Record<string, unknown> | undefined;
@@ -329,6 +351,7 @@ export class Store {
       this.settings.maliciousIpCidrs = readStringArray(row.malicious_ip_cidrs);
       this.settings.waitRoomDefaults = parseWaitRoom(row.wait_room_defaults);
       this.settings.captcha = parseCaptcha(row.captcha);
+      this.captchaSecretCiphertext = row.captcha_secret_ciphertext ? String(row.captcha_secret_ciphertext) : null;
       this.initialized = Boolean(row.initialized);
       if (row.admin_password_salt && row.admin_password_hash) {
         this.credential = { salt: String(row.admin_password_salt), hash: String(row.admin_password_hash) };
@@ -340,6 +363,15 @@ export class Store {
       this.apiKeyCiphertext = row.api_key_ciphertext ? String(row.api_key_ciphertext) : null;
     }
     await this.ensureDefaultAiProfile();
+    const profiles = await this.pool.query("SELECT * FROM ai_profiles");
+    const imports = await this.pool.query("SELECT * FROM nginx_imports ORDER BY created_at DESC LIMIT 100");
+    this.nginxImports = imports.rows.map((entry) => ({ id: String(entry.id), createdAt: new Date(entry.created_at).toISOString(), digest: String(entry.digest), ports: entry.ports as number[] })).reverse();
+    for (const row of profiles.rows) this.aiProfiles.set(String(row.id), {
+      id: String(row.id), name: String(row.name), baseUrl: String(row.base_url), model: String(row.model),
+      enabled: Boolean(row.enabled), priority: Number(row.priority), timeoutMs: Number(row.timeout_ms),
+      failureAction: row.failure_action === "allow" || row.failure_action === "block" ? row.failure_action : "inherit",
+      apiKeyConfigured: Boolean(row.api_key_ciphertext), apiKeyCiphertext: row.api_key_ciphertext ? String(row.api_key_ciphertext) : null,
+    });
     if (this.initialized && !row?.admin_password_hash && config.adminPassword) {
       this.credential = exportAdminCredential();
       await this.persistAdminCredential();
@@ -374,6 +406,11 @@ export class Store {
     this.normalizeSitePorts();
     this.normalizeUnavailableSiteModes();
     await this.persistSiteCompatibilityFields();
+    const bans = await this.pool.query("SELECT site_id,ip,until_ms,seconds,count FROM runtime_bans WHERE until_ms > $1", [Date.now()]);
+    for (const row of bans.rows) {
+      const ban = { siteId: String(row.site_id), ip: String(row.ip), until: Number(row.until_ms), seconds: Number(row.seconds), count: Number(row.count) };
+      this.runtimeBans.set(`${ban.siteId}\0${ban.ip}`, ban);
+    }
     await this.pool.query("CREATE UNIQUE INDEX IF NOT EXISTS sites_port_unique ON sites(listen_port)");
     const scoped = await this.pool.query("SELECT value FROM scoped_rules ORDER BY id");
     this.scopedRules = scoped.rows.map((entry) => entry.value as RuleException | AccessRule);
@@ -381,24 +418,17 @@ export class Store {
   }
 
   async listAiProfiles(): Promise<AiProfile[]> {
-    if (!this.pool) return [...this.aiProfiles.values()].map(({ apiKeyCiphertext: _secret, ...profile }) => structuredClone(profile));
-    const result = await this.pool.query("SELECT id,name,base_url,model,enabled,priority,timeout_ms,api_key_ciphertext FROM ai_profiles ORDER BY priority ASC, name ASC");
-    return result.rows.map((row) => ({ id: String(row.id), name: String(row.name), baseUrl: String(row.base_url), model: String(row.model), enabled: Boolean(row.enabled), priority: Number(row.priority), timeoutMs: Number(row.timeout_ms), apiKeyConfigured: Boolean(row.api_key_ciphertext) }));
+    return [...this.aiProfiles.values()].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name))
+      .map(({ apiKeyCiphertext: _secret, ...profile }) => structuredClone(profile));
   }
 
   async getAiProvider(id?: string | null): Promise<{ profile: AiProfile; provider: { baseUrl: string; apiKey: string } } | undefined> {
     const profiles = await this.listAiProfiles();
-    const selected = profiles.find((profile) => profile.id === (id ?? "default"))
-      ?? profiles.find((profile) => profile.enabled && profile.apiKeyConfigured)
-      ?? profiles.find((profile) => profile.enabled);
-    if (!selected || !selected.enabled) return undefined;
+    const selected = id ? profiles.find((profile) => profile.id === id) : profiles.find((profile) => profile.enabled && profile.apiKeyConfigured);
+    if (!selected || !selected.enabled || !selected.apiKeyConfigured) return undefined;
     let apiKey = "";
     if (selected.id === "default") {
       apiKey = this.apiKeyCiphertext ? decryptSecret(this.apiKeyCiphertext, config.sessionSecret) : config.environmentApiKey;
-    } else if (this.pool) {
-      const result = await this.pool.query("SELECT api_key_ciphertext FROM ai_profiles WHERE id=$1", [selected.id]);
-      const ciphertext = result.rows[0]?.api_key_ciphertext ? String(result.rows[0].api_key_ciphertext) : "";
-      apiKey = ciphertext ? decryptSecret(ciphertext, config.sessionSecret) : "";
     } else {
       const profile = this.aiProfiles.get(selected.id);
       apiKey = profile?.apiKeyCiphertext ? decryptSecret(profile.apiKeyCiphertext, config.sessionSecret) : "";
@@ -409,48 +439,44 @@ export class Store {
   }
 
   async saveAiProfile(input: AiProfileInput): Promise<AiProfile> {
-    const id = input.id?.trim() || randomUUID();
-    if (!input.name.trim() || input.name.length > 128) throw new ValidationError("Profile 名称无效");
-    const baseUrl = normalizeBaseUrl(input.baseUrl);
-    validateHttpEndpoint(baseUrl, "Jev Base URL");
-    if (!input.model.trim() || input.model.length > 256) throw new ValidationError("Profile 模型无效");
-    if (!Number.isInteger(input.priority ?? 100) || (input.priority ?? 100) < 0 || (input.priority ?? 100) > 100000) throw new ValidationError("Profile 优先级无效");
-    if (!Number.isInteger(input.timeoutMs ?? 2000) || (input.timeoutMs ?? 2000) < 100 || (input.timeoutMs ?? 2000) > 60000) throw new ValidationError("Profile 超时无效");
-    const ciphertext = input.apiKey?.trim() ? encryptSecret(input.apiKey.trim(), config.sessionSecret) : null;
-    if (!this.pool) {
+    return this.serializeMutation(async () => {
+      const id = input.id?.trim() || randomUUID();
       const current = this.aiProfiles.get(id);
+      if (id.length > 128) throw new ValidationError("Profile ID 无效");
+      if (typeof input.name !== "string" || !input.name.trim() || input.name.length > 128) throw new ValidationError("Profile 名称无效");
+      if (typeof input.baseUrl !== "string") throw new ValidationError("Jev Base URL 无效");
+      const baseUrl = normalizeBaseUrl(input.baseUrl);
+      validateHttpEndpoint(baseUrl, "Jev Base URL");
+      if (typeof input.model !== "string" || !input.model.trim() || input.model.length > 256) throw new ValidationError("Profile 模型无效");
+      const priority = input.priority ?? current?.priority ?? 100;
+      const timeoutMs = input.timeoutMs ?? current?.timeoutMs ?? 2000;
+      const failureAction = input.failureAction ?? current?.failureAction ?? "inherit";
+      if (!Number.isInteger(priority) || priority < 0 || priority > 100000) throw new ValidationError("Profile 优先级无效");
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60000) throw new ValidationError("Profile 超时无效");
+      if (!["inherit", "allow", "block"].includes(failureAction)) throw new ValidationError("Profile 失败策略无效");
+      if (input.enabled !== undefined && typeof input.enabled !== "boolean") throw new ValidationError("Profile 启用状态无效");
+      if (input.apiKey !== undefined && input.apiKey !== null && (typeof input.apiKey !== "string" || input.apiKey.length > 8192)) throw new ValidationError("Profile Key 无效");
+      if (!current && this.aiProfiles.size >= 64) throw new ValidationError("最多配置 64 个 Profile");
       const ciphertext = input.apiKey === undefined ? current?.apiKeyCiphertext ?? null : input.apiKey?.trim() ? encryptSecret(input.apiKey.trim(), config.sessionSecret) : null;
-      const profile = { id, name: input.name.trim(), baseUrl, model: input.model.trim(), enabled: input.enabled ?? current?.enabled ?? true, priority: input.priority ?? current?.priority ?? 100, timeoutMs: input.timeoutMs ?? current?.timeoutMs ?? 2000, apiKeyConfigured: Boolean(ciphertext || (id === "default" && config.environmentApiKey)), apiKeyCiphertext: ciphertext };
-      this.aiProfiles.set(id, profile);
-      if (id === "default") await this.updateSettings({ jevBaseUrl: baseUrl, model: profile.model, aiTimeoutMs: profile.timeoutMs, ...(input.apiKey === undefined ? {} : { apiKey: input.apiKey }) });
-      this.local!.writeState(this.snapshot());
-      const { apiKeyCiphertext: _secret, ...publicProfile } = profile;
-      return structuredClone(publicProfile);
-    }
-    await this.pool.query(`INSERT INTO ai_profiles(id,name,base_url,model,api_key_ciphertext,enabled,priority,timeout_ms,updated_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,base_url=EXCLUDED.base_url,model=EXCLUDED.model,
-      api_key_ciphertext=COALESCE(EXCLUDED.api_key_ciphertext,ai_profiles.api_key_ciphertext),enabled=EXCLUDED.enabled,priority=EXCLUDED.priority,timeout_ms=EXCLUDED.timeout_ms,updated_at=NOW()`,
-      [id, input.name.trim(), baseUrl, input.model.trim(), ciphertext, input.enabled ?? true, input.priority ?? 100, input.timeoutMs ?? 2000]);
-    return (await this.listAiProfiles()).find((profile) => profile.id === id)!;
+      const profile = { id, name: input.name.trim(), baseUrl, model: input.model.trim(), enabled: input.enabled ?? current?.enabled ?? true, priority, timeoutMs, failureAction, apiKeyConfigured: Boolean(ciphertext || (id === "default" && config.environmentApiKey)), apiKeyCiphertext: ciphertext };
+      const profiles = new Map(this.aiProfiles); profiles.set(id, profile);
+      await this.commitSettings(id === "default" ? { jevBaseUrl: baseUrl, model: profile.model, aiTimeoutMs: timeoutMs, ...(input.apiKey === undefined ? {} : { apiKey: input.apiKey }) } : {}, profiles);
+      return (await this.listAiProfiles()).find((entry) => entry.id === id)!;
+    });
   }
 
   async deleteAiProfile(id: string): Promise<void> {
-    if (id === "default") throw new ConflictError("默认 Profile 不能删除");
-    if (!this.pool) {
+    return this.serializeMutation(async () => {
       if (id === "default") throw new ConflictError("默认 Profile 不能删除");
-      this.aiProfiles.delete(id);
-      this.local!.writeState(this.snapshot());
-      return;
-    }
-    await this.pool.query("DELETE FROM ai_profiles WHERE id=$1", [id]);
+      if (this.listSites().some((site) => site.aiProfileId === id)) throw new ConflictError("请先修改使用此 Profile 的站点");
+      const profiles = new Map(this.aiProfiles); profiles.delete(id);
+      await this.commitSettings({}, profiles);
+    });
   }
 
   private async ensureDefaultAiProfile(): Promise<void> {
     if (!this.pool) return;
-    const exists = await this.pool.query("SELECT 1 FROM ai_profiles LIMIT 1");
-    if (!exists.rowCount) {
-      await this.pool.query("INSERT INTO ai_profiles(id,name,base_url,model,api_key_ciphertext,enabled,priority,timeout_ms) VALUES('default',$1,$2,$3,$4,TRUE,100,$5)", ["默认 Jev", this.settings.jevBaseUrl, this.settings.model, this.apiKeyCiphertext, this.settings.aiTimeoutMs]);
-    }
+    await this.pool.query("INSERT INTO ai_profiles(id,name,base_url,model,api_key_ciphertext,enabled,priority,timeout_ms) VALUES('default',$1,$2,$3,$4,TRUE,100,$5) ON CONFLICT(id) DO NOTHING", ["默认 Jev", this.settings.jevBaseUrl, this.settings.model, this.apiKeyCiphertext, this.settings.aiTimeoutMs]);
   }
 
   setupStatus(): {
@@ -462,7 +488,7 @@ export class Store {
     return {
       initialized: this.initialized,
       databaseConfigured: Boolean(this.pool),
-      aiConfigured: Boolean(config.openRouterKey),
+      aiConfigured: this.hasAiProfile(),
       geoIpConfigured: this.geoIp.isReady
     };
   }
@@ -515,23 +541,21 @@ export class Store {
   getSettings(): AppSettings {
     return structuredClone({
       ...this.settings,
-      apiKeyConfigured: Boolean(config.openRouterKey),
+      captcha: { ...this.settings.captcha, secretConfigured: Boolean(this.captchaSecretCiphertext || config.captchaSecret) },
+      apiKeyConfigured: this.hasAiProfile(),
       apiKeySource: this.settings.apiKeySource
     });
   }
 
+  getCaptchaSecret(): string {
+    return this.captchaSecretCiphertext ? decryptSecret(this.captchaSecretCiphertext, config.sessionSecret) : config.captchaSecret;
+  }
+
+  geoIpStatus() { return this.geoIp.status(); }
+  async uploadGeoIp(kind: "city" | "asn", filename: string, data: Buffer) { await this.geoIp.upload(kind, filename, data); return this.geoIp.status(); }
+
   readPage(page: PageConfig | undefined): string | undefined {
-    if (!page || page.source !== "file" || !page.filePath) return page?.html;
-    try {
-      const root = resolve(config.dataDir, "pages");
-      const target = resolve(root, page.filePath);
-      const relation = relative(root, target);
-      if (relation.startsWith(`..${sep}`) || relation === ".." || !existsSync(target)) return undefined;
-      if (!target.toLowerCase().endsWith(".html")) return undefined;
-      const body = readFileSync(target);
-      if (body.length > 512 * 1024) return undefined;
-      return body.toString("utf8");
-    } catch { return undefined; }
+    return readStaticPage(page);
   }
 
   getRuntimeBan(siteId: string, ip: string): RuntimeBan | undefined {
@@ -543,25 +567,44 @@ export class Store {
     return { ...ban };
   }
 
-  recordRuntimeBan(siteId: string, ip: string, baseSeconds: number, incrementSeconds: number, maxSeconds: number): RuntimeBan {
-    const key = `${siteId}\0${ip}`;
-    const previous = this.runtimeBans.get(key);
-    const count = (previous?.count ?? 0) + 1;
-    const seconds = Math.min(maxSeconds, baseSeconds + Math.max(0, count - 1) * incrementSeconds);
-    const ban = { siteId, ip, until: Date.now() + seconds * 1000, seconds, count };
-    this.runtimeBans.set(key, ban);
-    return { ...ban };
+  async recordRuntimeBan(siteId: string, ip: string, baseSeconds: number, incrementSeconds: number, maxSeconds: number): Promise<RuntimeBan> {
+    return this.serializeMutation(async () => {
+      const key = `${siteId}\0${ip}`;
+      if (Date.now() - this.lastBanSweep > 10000) {
+        for (const [entry, ban] of this.runtimeBans) if (ban.until <= Date.now()) this.runtimeBans.delete(entry);
+        this.lastBanSweep = Date.now();
+      }
+      let previous = this.runtimeBans.get(key);
+      if (!previous) {
+        if (this.pool) {
+          const row = (await this.pool.query("SELECT until_ms,seconds,count FROM runtime_bans WHERE site_id=$1 AND ip=$2", [siteId, ip])).rows[0];
+          if (row) previous = { siteId, ip, until: Number(row.until_ms), seconds: Number(row.seconds), count: Number(row.count) };
+        } else previous = this.local!.readRuntimeBan(siteId, ip);
+      }
+      const count = (previous?.count ?? 0) + 1;
+      const seconds = Math.min(maxSeconds, baseSeconds + Math.max(0, count - 1) * incrementSeconds);
+      const ban = { siteId, ip, until: Math.max(previous?.until ?? 0, Date.now() + seconds * 1000), seconds, count };
+      if (this.pool) await this.pool.query(`INSERT INTO runtime_bans(site_id,ip,until_ms,seconds,count) VALUES($1,$2,$3,$4,$5)
+        ON CONFLICT(site_id,ip) DO UPDATE SET until_ms=EXCLUDED.until_ms,seconds=EXCLUDED.seconds,count=EXCLUDED.count`, [siteId, ip, ban.until, seconds, count]);
+      else this.local!.writeRuntimeBan(ban);
+      this.runtimeBans.set(key, ban);
+      return { ...ban };
+    });
   }
 
   async updateSettings(next: SettingsUpdate): Promise<AppSettings> {
     return this.serializeMutation(() => this.commitSettings(next));
   }
 
-  private async commitSettings(next: SettingsUpdate): Promise<AppSettings> {
-    const { apiKey, ...settings } = next;
+  private async commitSettings(next: SettingsUpdate, profileChanges?: typeof this.aiProfiles): Promise<AppSettings> {
+    const { apiKey, captcha, ...settings } = next;
+    const { secret, ...captchaOptions } = captcha ?? {};
+    let captchaSecretCiphertext = this.captchaSecretCiphertext;
+    if (secret !== undefined) captchaSecretCiphertext = secret?.trim() ? encryptSecret(secret.trim(), config.sessionSecret) : null;
     const candidate: AppSettings = {
       ...this.settings,
       ...settings,
+      captcha: { ...this.settings.captcha, ...captchaOptions, secretConfigured: Boolean(captchaSecretCiphertext || config.captchaSecret) },
       jevBaseUrl: settings.jevBaseUrl ? normalizeBaseUrl(settings.jevBaseUrl) : this.settings.jevBaseUrl
     };
     if (settings.defaultPolicy !== undefined) candidate.defaultPolicy = parsePolicy(settings.defaultPolicy);
@@ -584,24 +627,36 @@ export class Store {
     const effectiveApiKey = apiKey !== undefined
       ? (apiKeyCiphertext ? decryptSecret(apiKeyCiphertext, config.sessionSecret) : config.environmentApiKey)
       : config.openRouterKey;
-    candidate.mode = effectiveApiKey ? candidate.mode : "traditional";
+    const profiles = new Map(profileChanges ?? this.aiProfiles);
+    profiles.set("default", {
+      ...profiles.get("default"), id: "default", name: profiles.get("default")?.name ?? "默认 Jev",
+      baseUrl: candidate.jevBaseUrl, model: candidate.model, timeoutMs: candidate.aiTimeoutMs,
+      enabled: profiles.get("default")?.enabled ?? true, priority: profiles.get("default")?.priority ?? 100,
+      failureAction: profiles.get("default")?.failureAction ?? "inherit",
+      apiKeyConfigured: Boolean(effectiveApiKey), apiKeyCiphertext,
+    });
+    candidate.mode = this.hasAiProfile(undefined, profiles) ? candidate.mode : "traditional";
     candidate.auditMode = candidate.auditMode === "async" ? "async" : "sync";
     candidate.whitelistCidrs = readStringArray(candidate.whitelistCidrs);
     candidate.maliciousIpCidrs = readStringArray(candidate.maliciousIpCidrs);
     candidate.waitRoomDefaults = parseWaitRoom(candidate.waitRoomDefaults);
     candidate.captcha = parseCaptcha(candidate.captcha);
+    if (candidate.captcha.enabled && candidate.captcha.provider !== "local" && (!candidate.captcha.siteKey || !candidate.captcha.secretConfigured)) throw new ValidationError("第三方人机验证需要 Site Key 和 Secret Key");
     validateSettings(candidate);
     const sites = this.listSites().map((site) => ({
       ...site,
       upstreamUrl: site.id === "default" ? candidate.upstreamUrl : site.upstreamUrl,
-      mode: effectiveProtectionMode(site.id === "default" ? candidate.mode : site.mode, Boolean(effectiveApiKey))
+      mode: effectiveProtectionMode(site.id === "default" ? candidate.mode : site.mode, this.hasAiProfile(site.aiProfileId, profiles))
       ,revision: (site.revision ?? 1) + 1,
       operationMode: site.operationMode ?? "defense",
       aiProfileId: site.aiProfileId ?? null,
+      auditMode: site.auditMode ?? null,
       waitRoom: parseWaitRoom(site.waitRoom ?? candidate.waitRoomDefaults),
       maintenance: parsePageConfig(site.maintenance, 503),
-      upstreamError: parsePageConfig(site.upstreamError, 502)
+      upstreamError: parsePageConfig(site.upstreamError, 502),
+      upstreamPool: normalizeUpstreamPool(site.upstreamPool)
     }));
+    candidate.mode = sites.find((site) => site.id === "default")?.mode ?? candidate.mode;
     const client = this.pool ? await this.pool.connect() : null;
     try {
       if (client) {
@@ -614,7 +669,7 @@ export class Store {
            default_policy = $11::jsonb, audit_mode = $12, async_ban_base_seconds = $13,
            async_ban_increment_seconds = $14, async_ban_max_seconds = $15,
            whitelist_cidrs = $16::jsonb, malicious_ip_cidrs = $17::jsonb,
-           wait_room_defaults = $18::jsonb, captcha = $19::jsonb, updated_at = NOW() WHERE id = 1`,
+           wait_room_defaults = $18::jsonb, captcha = $19::jsonb, captcha_secret_ciphertext = $20, updated_at = NOW() WHERE id = 1`,
           [
             candidate.mode, candidate.strength, candidate.customThreshold, candidate.model,
             candidate.jevBaseUrl, candidate.aiTimeoutMs, candidate.aiBodyLimit, candidate.upstreamUrl,
@@ -622,20 +677,25 @@ export class Store {
             apiKeyCiphertext ?? null, JSON.stringify(candidate.defaultPolicy), candidate.auditMode,
             candidate.asyncBanBaseSeconds, candidate.asyncBanIncrementSeconds, candidate.asyncBanMaxSeconds,
             JSON.stringify(candidate.whitelistCidrs), JSON.stringify(candidate.maliciousIpCidrs),
-            JSON.stringify(candidate.waitRoomDefaults), JSON.stringify(candidate.captcha)
+            JSON.stringify(candidate.waitRoomDefaults), JSON.stringify(candidate.captcha), captchaSecretCiphertext
           ]
         );
         for (const site of sites) {
           await client.query(
             `UPDATE sites SET upstream_url = $1, mode = $2, revision = $4, operation_mode = $5,
-             ai_profile_id = $6, wait_room = $7::jsonb, maintenance = $8::jsonb, upstream_error = $9::jsonb, redirect = $10::jsonb WHERE id = $3`,
+             ai_profile_id = $6, wait_room = $7::jsonb, maintenance = $8::jsonb, upstream_error = $9::jsonb, redirect = $10::jsonb, upstream_pool = $11::jsonb WHERE id = $3`,
             [site.upstreamUrl, site.mode, site.id, site.revision, site.operationMode, site.aiProfileId,
-              JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError), site.redirect ? JSON.stringify(site.redirect) : null]
+              JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError), site.redirect ? JSON.stringify(site.redirect) : null, JSON.stringify(site.upstreamPool ?? [])]
           );
         }
+        await client.query("DELETE FROM ai_profiles WHERE id <> ALL($1::text[])", [[...profiles.keys()]]);
+        for (const profile of profiles.values()) await client.query(`INSERT INTO ai_profiles(id,name,base_url,model,api_key_ciphertext,enabled,priority,timeout_ms,failure_action)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,base_url=EXCLUDED.base_url,model=EXCLUDED.model,
+          api_key_ciphertext=EXCLUDED.api_key_ciphertext,enabled=EXCLUDED.enabled,priority=EXCLUDED.priority,timeout_ms=EXCLUDED.timeout_ms,failure_action=EXCLUDED.failure_action,updated_at=NOW()`,
+          [profile.id, profile.name, profile.baseUrl, profile.model, profile.apiKeyCiphertext ?? null, profile.enabled, profile.priority, profile.timeoutMs, profile.failureAction ?? "inherit"]);
         await client.query("COMMIT");
       } else {
-        this.local!.writeState({ ...this.snapshot(), settings: candidate, apiKeyCiphertext, sites });
+        this.local!.writeState({ ...this.snapshot(), settings: candidate, apiKeyCiphertext, captchaSecretCiphertext, sites, aiProfiles: [...profiles.values()] });
       }
     } catch (error) {
       if (client) await client.query("ROLLBACK");
@@ -645,6 +705,8 @@ export class Store {
     }
     this.settings = candidate;
     this.apiKeyCiphertext = apiKeyCiphertext;
+    this.captchaSecretCiphertext = captchaSecretCiphertext;
+    this.aiProfiles = profiles;
     this.syncRuntimeSettings();
     for (const site of sites) this.sites.set(site.id, site);
     await this.notifySitesChanged();
@@ -725,6 +787,39 @@ export class Store {
     this.siteChangeListener = listener;
   }
 
+  listNginxImports(): NginxImportRecord[] { return [...this.nginxImports].sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+
+  async importSites(inputs: Array<Omit<Site, "id" | "createdAt" | "runtime">>, digest?: string): Promise<Site[]> {
+    return this.serializeMutation(async () => {
+      const used = new Set(this.listSites().map((site) => site.listenPort));
+      const sites = inputs.map((input) => {
+        validateSite(input);
+        if (used.has(input.listenPort)) throw new ConflictError(`入口端口 ${input.listenPort} 已被占用`);
+        used.add(input.listenPort);
+        return this.normalizeSite({ ...input, id: randomUUID(), createdAt: new Date().toISOString(), revision: 1, mode: effectiveProtectionMode(input.mode, this.hasAiProfile(input.aiProfileId)) });
+      });
+      const client = this.pool ? await this.pool.connect() : null;
+      const record: NginxImportRecord | undefined = digest ? { id: randomUUID(), createdAt: new Date().toISOString(), digest, ports: sites.map((site) => site.listenPort) } : undefined;
+      const history = record ? [...this.nginxImports, record].slice(-100) : this.nginxImports;
+      try {
+        if (client) {
+          await client.query("BEGIN");
+          for (const site of sites) await client.query(`INSERT INTO sites(id,name,listen_port,upstream_url,mode,enabled,revision,operation_mode,ai_profile_id,wait_room,maintenance,upstream_error,redirect,upstream_pool,audit_mode,created_at,captcha_enabled)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16,$17)`,
+            [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled, site.revision, site.operationMode, site.aiProfileId,
+              JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError), site.redirect ? JSON.stringify(site.redirect) : null, JSON.stringify(site.upstreamPool), site.auditMode, site.createdAt, site.captchaEnabled ?? null]);
+          if (record) await client.query("INSERT INTO nginx_imports(id,created_at,digest,ports) VALUES($1,$2,$3,$4::jsonb)", [record.id, record.createdAt, record.digest, JSON.stringify(record.ports)]);
+          await client.query("COMMIT");
+        } else this.local!.writeState({ ...this.snapshot(), sites: [...this.sites.values(), ...sites], nginxImports: history });
+      } catch (error) { if (client) await client.query("ROLLBACK"); throw error; }
+      finally { client?.release(); }
+      for (const site of sites) this.sites.set(site.id, site);
+      this.nginxImports = history;
+      await this.notifySitesChanged();
+      return this.listSites().filter((site) => sites.some((entry) => entry.id === site.id));
+    });
+  }
+
   async saveSite(input: Omit<Site, "createdAt" | "id" | "runtime" | "revision"> & { id?: string; listenPort?: number }): Promise<Site> {
     return this.serializeMutation(async () => {
       const current = input.id ? this.sites.get(input.id) : undefined;
@@ -741,14 +836,17 @@ export class Store {
         name: input.name,
         listenPort,
         upstreamUrl: input.upstreamUrl,
-        redirect: input.redirect ?? current?.redirect ?? null,
-        mode: effectiveProtectionMode(input.mode, Boolean(config.openRouterKey)),
+        upstreamPool: normalizeUpstreamPool(input.upstreamPool ?? current?.upstreamPool),
+        redirect: input.redirect === undefined ? current?.redirect ?? null : input.redirect,
+        mode: effectiveProtectionMode(input.mode, this.hasAiProfile(input.aiProfileId === undefined ? current?.aiProfileId : input.aiProfileId)),
         enabled: input.enabled,
         createdAt: current?.createdAt ?? new Date().toISOString(),
         policy: input.policy === undefined ? current?.policy ?? null : input.policy === null ? null : parsePolicy(input.policy),
         revision: (current?.revision ?? 0) + 1,
         operationMode: input.operationMode ?? current?.operationMode ?? "defense",
-        aiProfileId: input.aiProfileId ?? current?.aiProfileId ?? null,
+        aiProfileId: input.aiProfileId === undefined ? current?.aiProfileId ?? null : input.aiProfileId,
+        auditMode: input.auditMode === undefined ? current?.auditMode ?? null : input.auditMode,
+        captchaEnabled: input.captchaEnabled === undefined ? current?.captchaEnabled ?? null : input.captchaEnabled,
         waitRoom: input.waitRoom ?? current?.waitRoom ?? this.settings.waitRoomDefaults,
         maintenance: input.maintenance ?? current?.maintenance ?? { source: "default", statusCode: 503 },
         upstreamError: input.upstreamError ?? current?.upstreamError ?? { source: "default", statusCode: 502 }
@@ -762,15 +860,15 @@ export class Store {
           await client.query("BEGIN");
           await client.query(
             `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled, policy, revision, created_at,
-             operation_mode, ai_profile_id, wait_room, maintenance, upstream_error, redirect)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb)
+             operation_mode, ai_profile_id, wait_room, maintenance, upstream_error, redirect, upstream_pool, audit_mode, captcha_enabled)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb, $17, $18)
              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, listen_port = EXCLUDED.listen_port,
              upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled,
              policy = EXCLUDED.policy, revision = EXCLUDED.revision, operation_mode = EXCLUDED.operation_mode,
              ai_profile_id = EXCLUDED.ai_profile_id, wait_room = EXCLUDED.wait_room,
-             maintenance = EXCLUDED.maintenance, upstream_error = EXCLUDED.upstream_error, redirect = EXCLUDED.redirect`,
+             maintenance = EXCLUDED.maintenance, upstream_error = EXCLUDED.upstream_error, redirect = EXCLUDED.redirect, upstream_pool = EXCLUDED.upstream_pool, audit_mode = EXCLUDED.audit_mode, captcha_enabled = EXCLUDED.captcha_enabled`,
             [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled, site.policy ? JSON.stringify(site.policy) : null, site.revision, site.createdAt,
-              site.operationMode, site.aiProfileId, JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError), site.redirect ? JSON.stringify(site.redirect) : null]
+              site.operationMode, site.aiProfileId, JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError), site.redirect ? JSON.stringify(site.redirect) : null, JSON.stringify(site.upstreamPool ?? []), site.auditMode, site.captchaEnabled ?? null]
           );
           if (site.id === "default") {
             await client.query(
@@ -1113,8 +1211,9 @@ export class Store {
   private snapshot(): LocalState {
     return {
       settings: this.settings, initialized: this.initialized, credential: this.credential,
-      apiKeyCiphertext: this.apiKeyCiphertext, rules: this.rules, sites: [...this.sites.values()],
+      apiKeyCiphertext: this.apiKeyCiphertext, captchaSecretCiphertext: this.captchaSecretCiphertext, rules: this.rules, sites: [...this.sites.values()],
       aiProfiles: [...this.aiProfiles.values()],
+      nginxImports: this.nginxImports,
       builtinRuleIds: [...this.builtinRuleIds], scopedRules: this.scopedRules
     };
   }
@@ -1141,9 +1240,11 @@ export class Store {
       ...site,
       operationMode: site.operationMode === "record" || site.operationMode === "maintenance" ? site.operationMode : "defense",
       aiProfileId: site.aiProfileId ?? null,
+      auditMode: site.auditMode === "sync" || site.auditMode === "async" ? site.auditMode : null,
       waitRoom: parseWaitRoom(site.waitRoom ?? this.settings.waitRoomDefaults),
       maintenance: parsePageConfig(site.maintenance, 503),
-      upstreamError: parsePageConfig(site.upstreamError, 502)
+      upstreamError: parsePageConfig(site.upstreamError, 502),
+      upstreamPool: normalizeUpstreamPool(site.upstreamPool)
     };
   }
 
@@ -1152,8 +1253,15 @@ export class Store {
     config.openRouterModel = this.settings.model;
     config.openRouterKey = this.apiKeyCiphertext
       ? decryptSecret(this.apiKeyCiphertext, config.sessionSecret) : config.environmentApiKey;
-    this.settings.apiKeyConfigured = Boolean(config.openRouterKey);
-    this.settings.apiKeySource = this.apiKeyCiphertext ? "database" : config.environmentApiKey ? "environment" : "none";
+    const current = this.aiProfiles.get("default");
+    this.aiProfiles.set("default", { ...current, id: "default", name: current?.name ?? "默认 Jev",
+      baseUrl: this.settings.jevBaseUrl, model: this.settings.model, timeoutMs: this.settings.aiTimeoutMs,
+      enabled: current?.enabled ?? true, priority: current?.priority ?? 100, failureAction: current?.failureAction ?? "inherit",
+      apiKeyConfigured: Boolean(config.openRouterKey), apiKeyCiphertext: this.apiKeyCiphertext,
+    });
+    this.settings.apiKeyConfigured = this.hasAiProfile();
+    this.settings.apiKeySource = this.apiKeyCiphertext || [...this.aiProfiles.values()].some((profile) => profile.enabled && profile.apiKeyCiphertext)
+      ? "database" : config.environmentApiKey ? "environment" : "none";
   }
 
   private normalizeSitePorts(): void {
@@ -1173,11 +1281,14 @@ export class Store {
   }
 
   private normalizeUnavailableSiteModes(): void {
-    if (config.openRouterKey) return;
     for (const site of this.sites.values()) {
-      if (site.mode !== "traditional") site.mode = "traditional";
+      if (!this.hasAiProfile(site.aiProfileId)) site.mode = "traditional";
     }
-    if (this.settings.mode !== "traditional") this.settings.mode = "traditional";
+    if (!this.hasAiProfile()) this.settings.mode = "traditional";
+  }
+
+  private hasAiProfile(id?: string | null, profiles = this.aiProfiles): boolean {
+    return [...profiles.values()].some((profile) => (!id || profile.id === id) && profile.enabled && profile.apiKeyConfigured);
   }
 
   private findAvailableSitePort(used = new Set([...this.sites.values()].map((site) => site.listenPort))): number {
@@ -1243,6 +1354,7 @@ export class Store {
 }
 
 function validateSettings(settings: AppSettings): void {
+  for (const entries of [settings.whitelistCidrs, settings.maliciousIpCidrs]) if (entries.length > 5000 || entries.some((entry) => !validIpEntry(entry))) throw new ValidationError("IP 列表只能包含有效 IPv4、IPv6 或 CIDR，最多 5000 项");
   if (!["ai", "traditional", "hybrid"].includes(settings.mode)) throw new ValidationError("防护模式无效");
   if (!["veryLow", "low", "medium", "high", "extreme", "custom"].includes(settings.strength)) throw new ValidationError("防护强度无效");
   if (!Number.isFinite(settings.customThreshold) || settings.customThreshold < 0 || settings.customThreshold > 1) throw new ValidationError("阈值必须在 0 到 1 之间");
@@ -1268,6 +1380,9 @@ function validateSite(site: Omit<Site, "createdAt" | "id"> & { id?: string }): v
   if (typeof site.enabled !== "boolean") throw new ValidationError("站点启用状态无效");
   if (!["defense", "record", "maintenance"].includes(site.operationMode ?? "defense")) throw new ValidationError("站点运行模式无效");
   validateHttpEndpoint(site.upstreamUrl, "上游地址");
+  normalizeUpstreamPool(site.upstreamPool);
+  if (site.auditMode !== undefined && site.auditMode !== null && site.auditMode !== "sync" && site.auditMode !== "async") throw new ValidationError("审核模式无效");
+  if (site.captchaEnabled !== undefined && site.captchaEnabled !== null && typeof site.captchaEnabled !== "boolean") throw new ValidationError("人机验证开关无效");
   if (site.redirect !== undefined && site.redirect !== null) {
     if (site.redirect.statusCode !== 301 && site.redirect.statusCode !== 302) throw new ValidationError("跳转状态码必须是 301 或 302");
     validateHttpEndpoint(site.redirect.location, "跳转地址");
@@ -1326,13 +1441,17 @@ function parseWaitRoom(value: unknown): WaitRoomConfig {
     enabled: Boolean(source.enabled),
     maxActive: clampInteger(source.maxActive, 100, 1, 100000),
     maxQueue: clampInteger(source.maxQueue, 100, 0, 100000),
-    timeoutSeconds: clampInteger(source.timeoutSeconds, 60, 1, 86400)
+    timeoutSeconds: clampInteger(source.timeoutSeconds, 60, 1, 86400),
+    fullAction: source.fullAction === "unavailable" ? "unavailable" : "reject",
+    ...(source.page ? { page: parsePageConfig(source.page, 429) } : {})
   };
 }
 
 function parsePageConfig(value: unknown, statusCode: number): PageConfig {
   const source = typeof value === "object" && value !== null ? value as Partial<PageConfig> : {};
   const sourceType = source.source === "file" || source.source === "inline" ? source.source : "default";
+  if (sourceType === "inline") validateHtml(Buffer.from(source.html ?? "", "utf8"));
+  if (sourceType === "file" && (!source.filePath || !source.filePath.toLowerCase().endsWith(".html") || /(^|[\\/])\.\.([\\/]|$)|^[\\/]|^[a-z]:/i.test(source.filePath))) throw new ValidationError("页面路径必须是 pages 目录内的相对 .html 路径");
   return {
     source: sourceType,
     ...(typeof source.filePath === "string" && source.filePath ? { filePath: source.filePath } : {}),
@@ -1344,7 +1463,7 @@ function parsePageConfig(value: unknown, statusCode: number): PageConfig {
 function parseCaptcha(value: unknown): AppSettings["captcha"] {
   const source = typeof value === "object" && value !== null ? value as Partial<AppSettings["captcha"]> : {};
   const provider = source.provider === "turnstile" || source.provider === "hcaptcha" || source.provider === "recaptcha" ? source.provider : "local";
-  return { enabled: Boolean(source.enabled), provider, siteKey: typeof source.siteKey === "string" ? source.siteKey : "", secretConfigured: Boolean(source.secretConfigured) };
+  return { enabled: Boolean(source.enabled), provider, siteKey: typeof source.siteKey === "string" ? source.siteKey : "", secretConfigured: Boolean(source.secretConfigured), timeoutMs: clampInteger(source.timeoutMs, 5000, 100, 30000), failureAction: source.failureAction === "allow" ? "allow" : "block", trigger: source.trigger === "cc" ? "cc" : "always" };
 }
 
 function clampInteger(value: unknown, fallback: number, min: number, max: number): number {
@@ -1407,9 +1526,12 @@ function mapSite(row: QueryResultRow): Site {
     revision: Number(row.revision ?? 1),
     operationMode: row.operation_mode === "record" || row.operation_mode === "maintenance" ? row.operation_mode : "defense",
     aiProfileId: row.ai_profile_id ? String(row.ai_profile_id) : null,
+    auditMode: row.audit_mode === "sync" || row.audit_mode === "async" ? row.audit_mode : null,
+    captchaEnabled: typeof row.captcha_enabled === "boolean" ? row.captcha_enabled : null,
     waitRoom: parseWaitRoom(row.wait_room),
     maintenance: parsePageConfig(row.maintenance, 503),
     upstreamError: parsePageConfig(row.upstream_error, 502),
+    upstreamPool: normalizeUpstreamPool(row.upstream_pool),
     redirect: parseRedirect(row.redirect) ?? null
   };
 }
@@ -1423,6 +1545,24 @@ function parseRedirect(value: unknown): Site["redirect"] {
     if (target.protocol !== "http:" && target.protocol !== "https:") return null;
   } catch { return null; }
   return { statusCode: source.statusCode, location: source.location.trim() };
+}
+
+function normalizeUpstreamPool(value: unknown): Array<{ url: string; weight?: number }> {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 32) throw new ValidationError("上游池最多包含 32 个节点");
+  const seen = new Set<string>();
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object") throw new ValidationError("上游节点必须包含 URL 和权重");
+    const source = entry as { url?: unknown; weight?: unknown };
+    if (typeof source.url !== "string") throw new ValidationError("上游节点 URL 无效");
+    const url = source.url.trim();
+    validateHttpEndpoint(url, "上游节点地址");
+    if (seen.has(url)) throw new ValidationError("上游池不能包含重复地址");
+    seen.add(url);
+    const weight = source.weight ?? 1;
+    if (typeof weight !== "number" || !Number.isInteger(weight) || weight < 1 || weight > 1000) throw new ValidationError("上游权重必须是 1 到 1000 的整数");
+    return { url, weight };
+  });
 }
 
 function isSitePort(value: unknown): value is number {

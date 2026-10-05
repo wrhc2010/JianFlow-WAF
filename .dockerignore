@@ -11,6 +11,11 @@ certs
 coverage
 data
 geoip
+secrets
+config
+pages
+verification
+**/verification
 **/*.mmdb
 **/session-secret
 *.log

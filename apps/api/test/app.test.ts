@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { config } from "../src/config.js";
@@ -15,6 +16,8 @@ test("management setup, production HTTP login, validation and private key respon
   const store = new Store();
   await store.init();
   const app = await createApp(store, false);
+  let parsedUploads = 0;
+  app.addHook("preParsing", async (_request, _reply, payload) => { parsedUploads++; return payload; });
   t.after(async () => { await app.close(); await store.close(); });
   const status = await app.inject("/api/v1/setup/status");
   assert.equal(status.statusCode, 200);
@@ -27,10 +30,21 @@ test("management setup, production HTTP login, validation and private key respon
   assert.equal((await app.inject({ method: "POST", url: "/api/v1/setup",
     payload: { password: "Test-password-2026", confirmPassword: "Test-password-2026" } })).statusCode, 409);
   assert.equal((await app.inject("/api/v1/settings")).statusCode, 401);
+  const beforeUpload = parsedUploads;
+  const deniedUpload = await app.inject({ method: "PUT", url: "/api/v1/geoip/city", headers: { "content-type": "application/octet-stream", "x-filename": "city.mmdb" }, payload: Buffer.from("not a database") });
+  assert.equal(deniedUpload.statusCode, 401);
+  assert.equal(parsedUploads, beforeUpload, "unauthenticated uploads must not read or parse the body");
   const login = await app.inject({ method: "POST", url: "/api/v1/auth/login",
     payload: { username: "admin", password: "Test-password-2026" } });
   assert.equal(login.statusCode, 200);
   const cookie = String(login.headers["set-cookie"]).split(";")[0]!;
+  const city = await readFile(new URL("./fixtures/GeoIP2-City-Test.mmdb", import.meta.url));
+  const geoUpload = await app.inject({ method: "PUT", url: "/api/v1/geoip/city", headers: { cookie, "content-type": "application/octet-stream", "x-filename": "City.mmdb" }, payload: city });
+  assert.equal(geoUpload.statusCode, 200);
+  assert.equal(geoUpload.json().city.ready, true);
+  const badGeoUpload = await app.inject({ method: "PUT", url: "/api/v1/geoip/city", headers: { cookie, "content-type": "application/octet-stream", "x-filename": "City.mmdb" }, payload: Buffer.from("invalid") });
+  assert.equal(badGeoUpload.statusCode, 422);
+  assert.equal((await app.inject({ url: "/api/v1/geoip", headers: { cookie } })).json().city.ready, true);
   assert.match(String(login.headers["set-cookie"]), /HttpOnly/);
   assert.doesNotMatch(String(login.headers["set-cookie"]), /; Secure/);
   assert.equal((await app.inject({ url: "/api/v1/auth/me", headers: { cookie } })).statusCode, 200);

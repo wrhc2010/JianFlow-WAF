@@ -18,7 +18,8 @@ COPY --from=build /app/packages/waf-core/dist ./packages/waf-core/dist
 COPY --from=build /app/apps/api/package.json ./apps/api/package.json
 COPY --from=build /app/apps/api/dist ./apps/api/dist
 RUN npm ci --omit=dev --workspace=apps/api --workspace=packages/waf-core && apk add --no-cache su-exec
-COPY --chmod=755 apps/api/docker-entrypoint.sh /usr/local/bin/jianflow-entrypoint
+COPY apps/api/docker-entrypoint.sh /usr/local/bin/jianflow-entrypoint
+RUN chmod 755 /usr/local/bin/jianflow-entrypoint
 EXPOSE 4000 8080-8099 8443
 ENTRYPOINT ["jianflow-entrypoint"]
 CMD ["node", "apps/api/dist/server.js"]

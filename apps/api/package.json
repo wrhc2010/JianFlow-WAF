@@ -16,13 +16,16 @@
     "@fastify/rate-limit": "^10.3.0",
     "@fastify/websocket": "^11.0.2",
     "@jev-waf/core": "0.3.0",
-    "ajv": "^8.17.1",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "busboy": "^1.6.0",
+    "csv-parse": "^7.0.3",
     "fast-xml-parser": "^5.11.2",
     "fastify": "^5.2.1",
     "http-proxy": "^1.18.1",
     "jsonc-parser": "^3.3.1",
     "maxmind": "^5.0.7",
+    "nginx-conf": "^2.1.0",
     "pg": "^8.13.1"
   },
   "devDependencies": {

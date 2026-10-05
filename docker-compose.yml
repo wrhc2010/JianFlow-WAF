@@ -30,8 +30,8 @@ services:
       PROXY_PORT: 8080
       SITE_PORT_RANGE: ${SITE_PORT_RANGE:-8080-8099}
       HTTPS_PORT: 8443
-      TLS_KEY_PATH: ${TLS_KEY_PATH:-}
-      TLS_CERT_PATH: ${TLS_CERT_PATH:-}
+      TLS_KEY_PATH: ""
+      TLS_CERT_PATH: ""
       DATABASE_URL: ${DATABASE_URL:-}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
@@ -55,20 +55,29 @@ services:
       AI_MAX_CONCURRENT: ${AI_MAX_CONCURRENT:-8}
       AI_REQUESTS_PER_MINUTE: ${AI_REQUESTS_PER_MINUTE:-120}
       EVENT_QUEUE_LIMIT: ${EVENT_QUEUE_LIMIT:-2000}
+      CAPTCHA_ENABLED: ${CAPTCHA_ENABLED:-false}
+      CAPTCHA_PROVIDER: ${CAPTCHA_PROVIDER:-local}
+      CAPTCHA_SITE_KEY: ${CAPTCHA_SITE_KEY:-}
+      CAPTCHA_SECRET_KEY: ${CAPTCHA_SECRET_KEY:-}
+      CAPTCHA_TIMEOUT_MS: ${CAPTCHA_TIMEOUT_MS:-5000}
+      CAPTCHA_FAILURE_ACTION: ${CAPTCHA_FAILURE_ACTION:-block}
       DATA_DIR: /app/data
+      JIANFLOW_CONFIG_FILE: ${JIANFLOW_CONFIG_FILE:-}
+      JIANFLOW_PAGES_DIR: /app/pages
       GEOIP_DATABASE_PATH: ${GEOIP_DATABASE_PATH:-/app/geoip/GeoLite2-City.mmdb}
       GEOIP_ASN_DATABASE_PATH: ${GEOIP_ASN_DATABASE_PATH:-/app/geoip/GeoLite2-ASN.mmdb}
-      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.29.83.2/32}
     secrets:
       - postgres_password
-    ports:
-      - "127.0.0.1:4000:4000"
-      - "${SITE_PORT_RANGE:-8080-8099}:${SITE_PORT_RANGE:-8080-8099}"
-      - "8443:8443"
+    expose:
+      - "4000"
+      - "${SITE_PORT_RANGE:-8080-8099}"
     volumes:
       - ${TLS_CERT_DIR:-./certs}:/app/certs:ro
       - jevwaf-data:/app/data
       - ${GEOIP_DIR:-./geoip}:/app/geoip:ro
+      - ${CONFIG_DIR:-./config}:/app/config:ro
+      - ${PAGES_DIR:-./pages}:/app/pages:ro
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
@@ -80,6 +89,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      default: {}
+      gateway:
+        ipv4_address: ${API_GATEWAY_IP:-172.29.83.3}
 
   web:
     image: ghcr.io/wrhc2010/jianflow-waf-web:${IMAGE_TAG:-latest}
@@ -89,6 +102,17 @@ services:
       dockerfile: apps/web/Dockerfile
     ports:
       - "127.0.0.1:3000:80"
+      - "${SITE_PORT_RANGE:-8080-8099}:${SITE_PORT_RANGE:-8080-8099}"
+      - "8443:8443"
+    environment:
+      SITE_PORT_RANGE: ${SITE_PORT_RANGE:-8080-8099}
+      GATEWAY_TLS_CERT: ${TLS_CERT_PATH:-}
+      GATEWAY_TLS_KEY: ${TLS_KEY_PATH:-}
+    volumes:
+      - ${TLS_CERT_DIR:-./certs}:/app/certs:ro
+    networks:
+      gateway:
+        ipv4_address: ${GATEWAY_IP:-172.29.83.2}
     depends_on:
       api:
         condition: service_healthy
@@ -101,6 +125,12 @@ services:
 volumes:
   jevwaf-postgres:
   jevwaf-data:
+
+networks:
+  gateway:
+    ipam:
+      config:
+        - subnet: ${GATEWAY_SUBNET:-172.29.83.0/24}
 
 secrets:
   postgres_password:

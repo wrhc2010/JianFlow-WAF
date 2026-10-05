@@ -1,10 +1,10 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AppSettings, EventRecord, EventFilters, TimeSeriesPoint, AttackMap, PageConfig, WaitRoomConfig, AiProfile } from "./store.js";
+import type { AppSettings, EventRecord, EventFilters, TimeSeriesPoint, AttackMap, AiProfile, Site, RuntimeBan, NginxImportRecord } from "./store.js";
 import type { WafRule } from "@jev-waf/core";
 import { SetupConflictError } from "../errors.js";
-import type { ProtectionMode, SitePolicy, RuleException, AccessRule } from "@jev-waf/core";
+import type { RuleException, AccessRule } from "@jev-waf/core";
 
 export type LocalState = {
   settings: AppSettings;
@@ -12,10 +12,13 @@ export type LocalState = {
   credential?: { salt: string; hash: string } | undefined;
   apiKeyCiphertext: string | null;
   aiProfiles?: Array<AiProfile & { apiKeyCiphertext?: string | null }>;
+  captchaSecretCiphertext?: string | null;
+  runtimeBans?: RuntimeBan[];
+  nginxImports?: NginxImportRecord[];
   rules: WafRule[];
   builtinRuleIds?: string[] | undefined;
   scopedRules?: Array<RuleException | AccessRule>;
-  sites: Array<{ id: string; name: string; listenPort: number; upstreamUrl: string; redirect?: { statusCode: 301 | 302; location: string } | null; mode: ProtectionMode; enabled: boolean; createdAt: string; policy?: SitePolicy | null; revision?: number; operationMode?: "defense" | "record" | "maintenance"; aiProfileId?: string | null; waitRoom?: WaitRoomConfig; maintenance?: PageConfig; upstreamError?: PageConfig }>;
+  sites: Array<Omit<Site, "runtime">>;
 };
 
 export class LocalDatabase {
@@ -36,6 +39,10 @@ export class LocalDatabase {
       CREATE INDEX IF NOT EXISTS events_time_idx ON events(json_extract(value, '$.createdAt') DESC, id DESC);
       CREATE INDEX IF NOT EXISTS events_site_idx ON events(json_extract(value, '$.siteId'), json_extract(value, '$.createdAt') DESC);
       CREATE TABLE IF NOT EXISTS event_totals(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS runtime_bans (
+        site_id TEXT NOT NULL, ip TEXT NOT NULL, until_ms INTEGER NOT NULL,
+        seconds INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(site_id, ip)
+      );
     `);
     if (!this.db.prepare("SELECT id FROM event_totals WHERE id=1").get()) {
       this.db.prepare("INSERT INTO event_totals(id,value) VALUES(1,?)").run(JSON.stringify(this.eventSummary()));
@@ -50,6 +57,32 @@ export class LocalDatabase {
   writeState(state: LocalState): void {
     this.db.prepare("INSERT INTO state (id, value) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value")
       .run(JSON.stringify(state));
+  }
+
+  migrateRuntimeBans(bans: RuntimeBan[]): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const insert = this.db.prepare("INSERT INTO runtime_bans(site_id,ip,until_ms,seconds,count) VALUES(?,?,?,?,?) ON CONFLICT(site_id,ip) DO NOTHING");
+      for (const ban of bans) insert.run(ban.siteId, ban.ip, ban.until, ban.seconds, ban.count);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  readRuntimeBan(siteId: string, ip: string): RuntimeBan | undefined {
+    const row = this.db.prepare("SELECT * FROM runtime_bans WHERE site_id=? AND ip=?").get(siteId, ip);
+    return row ? { siteId, ip, until: Number(row.until_ms), seconds: Number(row.seconds), count: Number(row.count) } : undefined;
+  }
+
+  activeRuntimeBans(now: number): RuntimeBan[] {
+    return this.db.prepare("SELECT * FROM runtime_bans WHERE until_ms>?").all(now).map((row) => ({
+      siteId: String(row.site_id), ip: String(row.ip), until: Number(row.until_ms), seconds: Number(row.seconds), count: Number(row.count),
+    }));
+  }
+
+  writeRuntimeBan(ban: RuntimeBan): void {
+    this.db.prepare(`INSERT INTO runtime_bans(site_id,ip,until_ms,seconds,count) VALUES(?,?,?,?,?)
+      ON CONFLICT(site_id,ip) DO UPDATE SET until_ms=excluded.until_ms,seconds=excluded.seconds,count=excluded.count`)
+      .run(ban.siteId, ban.ip, ban.until, ban.seconds, ban.count);
   }
 
   completeSetup(state: LocalState): void {

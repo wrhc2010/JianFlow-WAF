@@ -4,7 +4,7 @@ import net from "node:net";
 import { once } from "node:events";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
-import { BUILTIN_RULES, type WafDecision } from "@jev-waf/core";
+import { BUILTIN_RULES, defaultPolicy, type WafDecision } from "@jev-waf/core";
 import { createProxyServer } from "../src/proxy.js";
 import { ProxyListenerManager } from "../src/proxy-manager.js";
 import type { Store } from "../src/db/store.js";
@@ -253,6 +253,181 @@ test("dynamic traffic bans reject later requests", { timeout: 5000 }, async (t) 
   // The runtime ban API is deliberately exercised through the same Store-compatible control path.
   const { trafficRuntime } = await import("../src/proxy.js");
   assert.equal(trafficRuntime(store).concurrent, 0);
+});
+
+test("async malicious verdict interrupts an active proxied response", { timeout: 10000 }, async (t) => {
+  let releaseVerdict!: (response: Response) => void;
+  const verdict = new Promise<Response>((resolve) => { releaseVerdict = resolve; });
+  let reached = 0;
+  let closedUpstream!: () => void;
+  const upstreamClosed = new Promise<void>((resolve) => { closedUpstream = resolve; });
+  const upstream = http.createServer((_request, response) => {
+    reached++;
+    response.writeHead(200);
+    response.write("started");
+    response.once("close", closedUpstream);
+  });
+  const upstreamPort = await listen(upstream);
+  const events: WafDecision[] = [];
+  const store = {
+    getSettings: () => ({ mode: "hybrid", strength: "medium", customThreshold: 0.5, model: "test", aiTimeoutMs: 100, aiBodyLimit: 32768, upstreamUrl: `http://127.0.0.1:${upstreamPort}`, auditMode: "async", asyncBanBaseSeconds: 60, asyncBanIncrementSeconds: 60, asyncBanMaxSeconds: 3600, whitelistCidrs: [], maliciousIpCidrs: [], captcha: { enabled: false, provider: "local" } }),
+    listRules: () => BUILTIN_RULES,
+    listScopedRules: () => [],
+    getSiteByPort: () => ({ id: "async-site", name: "Async", listenPort: 28083, upstreamUrl: `http://127.0.0.1:${upstreamPort}`, mode: "hybrid", enabled: true, createdAt: "", aiProfileId: "profile" }),
+    effectivePolicy: () => ({ ...defaultPolicy(), aiScope: "all", aiBehavior: "enforce" }),
+    getAiProvider: async () => ({ profile: { model: "test", timeoutMs: 2000 }, provider: { baseUrl: "http://jev.test", apiKey: "secret" } }),
+    recordRuntimeBan: () => ({ siteId: "async-site", ip: "127.0.0.1", until: Date.now() + 60000, seconds: 60, count: 1 }),
+    saveEvent: async (decision: WafDecision) => { events.push(decision); },
+  } as unknown as Store;
+  const proxy = createProxyServer(store, 28083);
+  const proxyPort = await listen(proxy);
+  t.mock.method(globalThis, "fetch", () => verdict);
+  t.after(() => { releaseVerdict(new Response()); proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+  const result = await new Promise<{ status: number; ended: boolean }>((resolve, reject) => {
+    const request = http.get({ host: "127.0.0.1", port: proxyPort, path: "/slow" }, (response) => {
+      let ended = false;
+      response.once("data", () => {
+        assert.equal(reached, 1);
+        assert.equal(events.some((event) => event.module === "async-ai"), false);
+        releaseVerdict(new Response(JSON.stringify({ answers: { malicious: { noul: 0.99 } } })));
+      });
+      response.on("end", () => { ended = true; resolve({ status: response.statusCode!, ended }); });
+      response.on("close", () => { if (!ended) resolve({ status: response.statusCode!, ended }); });
+    });
+    request.on("error", reject);
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.ended, false);
+  await upstreamClosed;
+  assert.ok(events.some((event) => event.module === "async-ai"));
+});
+
+test("upstream pools honor weights above 100 without capping the ratio", { timeout: 10000 }, async (t) => {
+  const counts = [0, 0];
+  const upstreams = counts.map((_, index) => http.createServer((_request, response) => { counts[index]++; response.end("ok"); }));
+  const ports = await Promise.all(upstreams.map(listen));
+  const store = {
+    getSettings: () => ({ mode: "traditional", strength: "medium", customThreshold: 0.5, model: "test", aiTimeoutMs: 100, aiBodyLimit: 32768, upstreamUrl: `http://127.0.0.1:${ports[0]}` }),
+    getSiteByPort: () => ({ id: "pool", name: "Pool", enabled: true, mode: "traditional", listenPort: 8080, upstreamUrl: `http://127.0.0.1:${ports[0]}`, upstreamPool: ports.map((port, index) => ({ url: `http://127.0.0.1:${port}`, weight: index === 0 ? 1000 : 10 })) }),
+    listRules: () => [], saveEvent: async () => {},
+  } as unknown as Store;
+  const proxy = createProxyServer(store);
+  const port = await listen(proxy);
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); for (const upstream of upstreams) { upstream.closeAllConnections(); upstream.close(); } });
+  for (let index = 0; index < 101; index++) assert.equal(await exchange(port, "/"), 200);
+  assert.deepEqual(counts, [100, 1]);
+});
+
+test("async audit closes an established WebSocket on both sides", { timeout: 10000 }, async (t) => {
+  let releaseVerdict!: (response: Response) => void;
+  const verdict = new Promise<Response>((resolve) => { releaseVerdict = resolve; });
+  let upstreamSocket: import("node:stream").Duplex | undefined;
+  let upstreamEnded = false;
+  let upstreamClosed!: () => void;
+  const closed = new Promise<void>((resolve) => { upstreamClosed = resolve; });
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    upstreamSocket = socket;
+    socket.once("close", upstreamClosed);
+    socket.once("end", () => { upstreamEnded = true; socket.end(); });
+    socket.on("error", () => {});
+    socket.resume();
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+  });
+  const upstreamPort = await listen(upstream);
+  let bans = 0;
+  const store = {
+    getSettings: () => ({ mode: "hybrid", strength: "medium", customThreshold: 0.5, model: "test", aiBodyLimit: 32768, auditMode: "sync", asyncBanBaseSeconds: 60, asyncBanIncrementSeconds: 60, asyncBanMaxSeconds: 3600 }),
+    getSiteByPort: () => ({ id: "socket", enabled: true, listenPort: 8080, mode: "hybrid", auditMode: "async", upstreamUrl: `http://127.0.0.1:${upstreamPort}` }),
+    effectivePolicy: () => ({ ...defaultPolicy(), aiScope: "all" }),
+    listRules: () => [],
+    getAiProvider: async () => ({ profile: { model: "test", timeoutMs: 2000 }, provider: { baseUrl: "http://jev.test", apiKey: "secret" } }),
+    recordRuntimeBan: async () => { bans++; return { seconds: 60 }; },
+    saveEvent: async () => {},
+  } as unknown as Store;
+  const proxy = createProxyServer(store);
+  const port = await listen(proxy);
+  let clientSocket: import("node:stream").Duplex | undefined;
+  t.after(() => { releaseVerdict(new Response()); clientSocket?.destroy(); upstreamSocket?.destroy(); proxy.closeAllConnections(); proxy.close(); upstream.close(); });
+  t.mock.method(globalThis, "fetch", () => verdict);
+  await new Promise<void>((resolve, reject) => {
+    const request = http.get({ host: "127.0.0.1", port, path: "/socket", headers: { connection: "Upgrade", upgrade: "websocket" } });
+    request.on("error", reject);
+    request.on("upgrade", (response, socket) => {
+      assert.equal(response.statusCode, 101);
+      clientSocket = socket;
+      socket.on("error", () => {});
+      socket.once("close", resolve);
+      socket.resume();
+      releaseVerdict(new Response('{"answers":{"malicious":{"noul":0.99}}}'));
+    });
+  });
+  await closed;
+  assert.equal(upstreamEnded, true);
+  assert.equal(bans, 1);
+});
+
+for (const scenario of ["record", "late-whitelist"] as const) {
+  test(`async ${scenario} records a malicious verdict without interrupting traffic`, { timeout: 10000 }, async (t) => {
+    let releaseVerdict!: (response: Response) => void;
+    const verdict = new Promise<Response>((resolve) => { releaseVerdict = resolve; });
+    let upstreamResponse: http.ServerResponse | undefined;
+    const upstream = http.createServer((_request, response) => { upstreamResponse = response; response.write("started"); });
+    const upstreamPort = await listen(upstream);
+    const settings = { mode: "hybrid", strength: "medium", customThreshold: 0.5, model: "test", aiBodyLimit: 32768, auditMode: "async", whitelistCidrs: [] as string[] };
+    let auditSaved!: (decision: WafDecision) => void;
+    const audited = new Promise<WafDecision>((resolve) => { auditSaved = resolve; });
+    let bans = 0;
+    const store = {
+      getSettings: () => settings,
+      getSiteByPort: () => ({ id: "safe", enabled: true, listenPort: 8080, mode: "hybrid", operationMode: scenario === "record" ? "record" : "defense", upstreamUrl: `http://127.0.0.1:${upstreamPort}` }),
+      effectivePolicy: () => ({ ...defaultPolicy(), aiScope: "all" }), listRules: () => [],
+      getAiProvider: async () => ({ profile: { model: "test", timeoutMs: 2000 }, provider: { baseUrl: "http://jev.test", apiKey: "secret" } }),
+      recordRuntimeBan: async () => { bans++; return { seconds: 60 }; },
+      saveEvent: async (decision: WafDecision) => { if (decision.module === "async-ai") auditSaved(decision); },
+    } as unknown as Store;
+    const proxy = createProxyServer(store); const port = await listen(proxy);
+    t.after(() => { releaseVerdict(new Response()); proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+    t.mock.method(globalThis, "fetch", () => verdict);
+    const completed = new Promise<number>((resolve, reject) => {
+      const request = http.get({ host: "127.0.0.1", port, path: "/" }, (response) => {
+        response.once("data", () => {
+          if (scenario === "late-whitelist") settings.whitelistCidrs = ["127.0.0.1/32"];
+          releaseVerdict(new Response('{"answers":{"malicious":{"noul":0.99}}}'));
+        });
+        response.on("end", () => resolve(response.statusCode!));
+        response.on("error", reject);
+      });
+      request.on("error", reject);
+    });
+    const decision = await audited;
+    assert.equal(decision.action, "allow"); assert.equal(decision.wouldBlock, true); assert.equal(bans, 0);
+    assert.equal(upstreamResponse!.destroyed, false);
+    upstreamResponse!.end("done");
+    assert.equal(await completed, 200);
+  });
+}
+
+test("pool failover visits each node once and does not replay POST", { timeout: 10000 }, async (t) => {
+  const counts = [0, 0, 0];
+  const upstreams = counts.map((_, index) => http.createServer((request, response) => {
+    counts[index]++;
+    if (index < 2) request.socket.destroy();
+    else response.end("ok");
+  }));
+  const ports = await Promise.all(upstreams.map(listen));
+  const createStore = () => ({
+    getSettings: () => ({ mode: "traditional", strength: "medium", customThreshold: 0.5, model: "test", aiTimeoutMs: 100, aiBodyLimit: 32768, upstreamUrl: `http://127.0.0.1:${ports[0]}` }),
+    getSiteByPort: () => ({ id: "pool", name: "Pool", enabled: true, mode: "traditional", listenPort: 8080, upstreamUrl: `http://127.0.0.1:${ports[0]}`, upstreamPool: ports.map((port) => ({ url: `http://127.0.0.1:${port}`, weight: 1 })) }),
+    listRules: () => [], saveEvent: async () => {},
+  } as unknown as Store);
+  const proxies = [createProxyServer(createStore()), createProxyServer(createStore())];
+  const proxyPorts = await Promise.all(proxies.map(listen));
+  t.after(() => { for (const server of [...proxies, ...upstreams]) { server.closeAllConnections(); server.close(); } });
+  assert.equal(await exchange(proxyPorts[0]!, "/"), 200);
+  assert.deepEqual(counts, [1, 1, 1]);
+  assert.equal(await exchange(proxyPorts[1]!, "/", Buffer.from("operation=charge")), 502);
+  assert.deepEqual(counts, [2, 1, 1]);
 });
 
 test("site redirect returns the configured status and location", { timeout: 5000 }, async (t) => {

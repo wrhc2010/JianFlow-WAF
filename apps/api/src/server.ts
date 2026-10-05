@@ -2,10 +2,12 @@ import { createApp } from "./app.js";
 import { config } from "./config.js";
 import { Store } from "./db/store.js";
 import { ProxyListenerManager } from "./proxy-manager.js";
+import { applyConfigurationFile } from "./configuration-file.js";
 
 const store = new Store();
 await store.init();
 const app = await createApp(store);
+await applyConfigurationFile(app, store, config.configurationFile);
 const proxy = new ProxyListenerManager(store);
 store.setSiteChangeListener(() => proxy.sync());
 

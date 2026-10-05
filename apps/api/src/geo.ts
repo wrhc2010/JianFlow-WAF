@@ -1,6 +1,10 @@
 import { existsSync } from "node:fs";
-import maxmind, { type AsnResponse, type CityResponse, type Reader } from "maxmind";
+import { mkdir, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import maxmind, { Reader, type AsnResponse, type CityResponse } from "maxmind";
 import { config } from "./config.js";
+import { ValidationError } from "./errors.js";
 
 export type GeoPoint = {
   country?: string | undefined;
@@ -19,8 +23,31 @@ export class GeoIpResolver {
     return Boolean(this.reader);
   }
 
+  status() {
+    const describe = (reader: Reader<CityResponse> | Reader<AsnResponse> | undefined) => reader ? { ready: true, databaseType: reader.metadata.databaseType, buildDate: reader.metadata.buildEpoch.toISOString() } : { ready: false };
+    return { city: describe(this.reader), asn: describe(this.asnReader) };
+  }
+
+  async upload(kind: "city" | "asn", filename: string, data: Buffer): Promise<void> {
+    if (!filename.toLowerCase().endsWith(".mmdb") || !data.length || data.length > 128 * 1024 * 1024) throw new ValidationError("请选择 128 MB 以内的 .mmdb 文件");
+    let reader: Reader<CityResponse | AsnResponse>;
+    try {
+      reader = new Reader<CityResponse | AsnResponse>(data);
+      if (!reader.metadata.databaseType.toLowerCase().includes(kind)) throw new Error("数据库类型不匹配");
+      reader.get("1.1.1.1");
+    } catch { throw new ValidationError(`无效的 MaxMind ${kind === "city" ? "City" : "ASN"} 数据库`); }
+    const directory = join(config.dataDir, "geoip");
+    await mkdir(directory, { recursive: true });
+    const temporary = join(directory, `.${kind}-${randomUUID()}.tmp`);
+    await writeFile(temporary, data, { mode: 0o600 });
+    await rename(temporary, join(directory, `uploaded-${kind}.mmdb`));
+    if (kind === "city") this.reader = reader as Reader<CityResponse>;
+    else this.asnReader = reader as Reader<AsnResponse>;
+  }
+
   async init(): Promise<void> {
-    const databasePath = config.geoIpDatabasePath || `${config.dataDir}/geoip/GeoIP2-City.mmdb`;
+    const uploadedCity = join(config.dataDir, "geoip", "uploaded-city.mmdb");
+    const databasePath = existsSync(uploadedCity) ? uploadedCity : config.geoIpDatabasePath || `${config.dataDir}/geoip/GeoIP2-City.mmdb`;
     if (existsSync(databasePath)) {
       try {
         this.reader = await maxmind.open<CityResponse>(databasePath, { cache: { max: 512 } });
@@ -28,7 +55,8 @@ export class GeoIpResolver {
         console.warn(`GeoIP city database unavailable: ${error instanceof Error ? error.message : "unknown error"}`);
       }
     }
-    const asnPath = config.geoIpAsnDatabasePath || `${config.dataDir}/geoip/GeoIP2-ASN.mmdb`;
+    const uploadedAsn = join(config.dataDir, "geoip", "uploaded-asn.mmdb");
+    const asnPath = existsSync(uploadedAsn) ? uploadedAsn : config.geoIpAsnDatabasePath || `${config.dataDir}/geoip/GeoIP2-ASN.mmdb`;
     if (existsSync(asnPath)) {
       try {
         this.asnReader = await maxmind.open<AsnResponse>(asnPath, { cache: { max: 512 } });

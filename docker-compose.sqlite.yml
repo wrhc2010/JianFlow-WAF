@@ -1,0 +1,8 @@
+services:
+  postgres:
+    profiles: [postgres]
+  api:
+    environment:
+      DATABASE_URL: ""
+      POSTGRES_HOST: ""
+    depends_on: !reset {}

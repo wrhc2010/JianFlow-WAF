@@ -1,0 +1,32 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
+import test from "node:test";
+import { config } from "../src/config.js";
+import { GeoIpResolver } from "../src/geo.js";
+
+test("MMDB upload verifies type, performs real lookups and survives restart", async (t) => {
+  const previous = { ...config };
+  t.after(() => Object.assign(config, previous));
+  config.dataDir = resolve("../../../verification", `geo-${randomUUID()}`);
+  config.geoIpDatabasePath = ""; config.geoIpAsnDatabasePath = "";
+  const city = await readFile(new URL("./fixtures/GeoIP2-City-Test.mmdb", import.meta.url));
+  const asn = await readFile(new URL("./fixtures/GeoLite2-ASN-Test.mmdb", import.meta.url));
+  const resolver = new GeoIpResolver(); await resolver.init();
+  assert.equal(resolver.isReady, false);
+  await assert.rejects(resolver.upload("city", "bad.mmdb", Buffer.from("invalid")));
+  await assert.rejects(resolver.upload("city", "bad.html", city));
+  await assert.rejects(resolver.upload("city", "ASN.mmdb", asn));
+  await resolver.upload("city", "City.mmdb", city);
+  await resolver.upload("asn", "ASN.mmdb", asn);
+  assert.equal(resolver.status().city.ready, true);
+  assert.equal(resolver.lookup("81.2.69.160").city, "London");
+  assert.equal(resolver.lookup("1.0.0.1").asn, 15169);
+  const restart = new GeoIpResolver(); await restart.init();
+  assert.equal(restart.lookup("81.2.69.160").latitude, 51.5142);
+  assert.equal(restart.lookup("1.0.0.1").asn, 15169);
+  assert.deepEqual(restart.lookup("not-an-ip"), {});
+  await assert.rejects(restart.upload("city", "bad.mmdb", Buffer.from("invalid")));
+  assert.equal(restart.lookup("81.2.69.160").city, "London");
+});

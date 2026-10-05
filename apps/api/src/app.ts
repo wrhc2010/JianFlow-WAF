@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import Fastify, { type FastifyReply } from "fastify";
 import cookie from "@fastify/cookie";
 import websocket from "@fastify/websocket";
@@ -28,6 +28,18 @@ import { clientIp } from "./proxy.js";
 import { createChallenge, verifyChallenge } from "./captcha.js";
 import type { SitePolicy, RuleException, AccessRule } from "@jev-waf/core";
 import type { Site, AiProfileInput } from "./db/store.js";
+import { parseThreatFeed } from "./threat-feed.js";
+import { captureConfigurationSchemas } from "./configuration-file.js";
+
+const pageSchema = { type: "object", additionalProperties: false, required: ["source", "statusCode"], properties: {
+  source: { type: "string", enum: ["default", "file", "inline"] }, filePath: { type: "string", minLength: 1, maxLength: 256 },
+  html: { type: "string", maxLength: 512 * 1024 }, statusCode: { type: "integer", minimum: 400, maximum: 599 },
+} };
+const waitRoomSchema = { type: "object", additionalProperties: false, required: ["enabled", "maxActive", "maxQueue", "timeoutSeconds"], properties: {
+  enabled: { type: "boolean" }, maxActive: { type: "integer", minimum: 1, maximum: 100000 },
+  maxQueue: { type: "integer", minimum: 0, maximum: 100000 }, timeoutSeconds: { type: "integer", minimum: 1, maximum: 86400 },
+  page: pageSchema, fullAction: { type: "string", enum: ["reject", "unavailable"] },
+} };
 
 function notFound(reply: FastifyReply, detail: string, instance: string) {
   return reply.code(404).type("application/problem+json").send({ type: "about:blank", title: "Not Found", status: 404, detail, instance });
@@ -41,10 +53,12 @@ export async function createApp(store: Store, logger = true) {
       : false,
     ajv: { customOptions: { removeAdditional: false } },
   });
+  captureConfigurationSchemas(app);
 
   await app.register(cookie, { secret: config.sessionSecret });
   await app.register(websocket);
   await app.register(rateLimit, { global: false });
+  app.addContentTypeParser("application/octet-stream", { parseAs: "buffer", bodyLimit: 128 * 1024 * 1024 }, (_request, body, done) => done(null, body));
   app.setErrorHandler((error, request, reply) => {
     const failure = (
       error instanceof Error ? error : new Error("请求处理失败")
@@ -77,7 +91,7 @@ export async function createApp(store: Store, logger = true) {
       ok,
       service: "jianflow-waf-api",
       database: Boolean(config.databaseUrl),
-      aiConfigured: Boolean(config.openRouterKey),
+      aiConfigured: store.getSettings().apiKeyConfigured,
       setup: store.setupStatus(),
       timestamp: new Date().toISOString(),
     });
@@ -91,6 +105,7 @@ export async function createApp(store: Store, logger = true) {
   app.get("/api/v1/setup/status", async () => store.setupStatus());
 
   app.get<{ Params: { siteId: string } }>("/api/v1/captcha/challenge/:siteId", {
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     schema: { params: { type: "object", required: ["siteId"], additionalProperties: false, properties: { siteId: { type: "string", minLength: 1, maxLength: 128 } } } },
   }, async (request, reply) => {
     const settings = store.getSettings();
@@ -101,9 +116,10 @@ export async function createApp(store: Store, logger = true) {
     return createChallenge(request.params.siteId, ip);
   });
   app.post<{ Params: { siteId: string }; Body: { challenge: string; answer: string } }>("/api/v1/captcha/verify/:siteId", {
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     schema: {
       params: { type: "object", required: ["siteId"], additionalProperties: false, properties: { siteId: { type: "string", minLength: 1, maxLength: 128 } } },
-      body: { type: "object", required: ["challenge", "answer"], additionalProperties: false, properties: { challenge: { type: "string", minLength: 1, maxLength: 128 }, answer: { type: "string", minLength: 1, maxLength: 32 } } },
+      body: { type: "object", required: ["challenge", "answer"], additionalProperties: false, properties: { challenge: { type: "string", minLength: 1, maxLength: 2048 }, answer: { type: "string", minLength: 1, maxLength: 32 } } },
     },
   }, async (request, reply) => {
     const settings = store.getSettings();
@@ -208,7 +224,7 @@ export async function createApp(store: Store, logger = true) {
     return { ok: true };
   });
 
-  app.addHook("preHandler", async (request, reply) => {
+  app.addHook("onRequest", async (request, reply) => {
     if (
       request.url.startsWith("/api/v1/health") ||
       request.url.startsWith("/api/v1/setup") ||
@@ -319,9 +335,40 @@ export async function createApp(store: Store, logger = true) {
   );
 
   app.get("/api/v1/settings", async () => store.getSettings());
+  app.get("/api/v1/geoip", async () => store.geoIpStatus());
+  app.put<{ Params: { kind: "city" | "asn" }; Body: Buffer }>("/api/v1/geoip/:kind", {
+    bodyLimit: 128 * 1024 * 1024,
+    schema: { params: { type: "object", required: ["kind"], properties: { kind: { enum: ["city", "asn"] } } } },
+  }, async (request) => {
+    if (!Buffer.isBuffer(request.body)) throw new ValidationError("GeoIP 上传需要 application/octet-stream");
+    const filename = String(request.headers["x-filename"] ?? "");
+    return store.uploadGeoIp(request.params.kind, filename, request.body);
+  });
+  app.post<{ Body: { content: string; format: "text" | "json" | "csv" | "stix" | "taxii" } }>("/api/v1/ip-feed-previews", {
+    bodyLimit: 2 * 1024 * 1024,
+    schema: { body: { type: "object", required: ["content", "format"], additionalProperties: false, properties: { content: { type: "string", minLength: 1, maxLength: 1024 * 1024 }, format: { type: "string", enum: ["text", "json", "csv", "stix", "taxii"] } } } },
+  }, async (request) => {
+    try { return { data: parseThreatFeed(request.body.content, request.body.format) }; }
+    catch (error) { throw new ValidationError(error instanceof Error ? error.message : "IP 库格式无效"); }
+  });
+  const profileProperties = {
+    name: { type: "string", minLength: 1, maxLength: 128 }, baseUrl: { type: "string", minLength: 1, maxLength: 2048 },
+    model: { type: "string", minLength: 1, maxLength: 256 }, apiKey: { type: ["string", "null"], maxLength: 8192 },
+    enabled: { type: "boolean" }, priority: { type: "integer", minimum: 0, maximum: 100000 },
+    timeoutMs: { type: "integer", minimum: 100, maximum: 60000 }, failureAction: { type: "string", enum: ["inherit", "allow", "block"] },
+  };
   app.get("/api/v1/ai-profiles", async () => ({ data: await store.listAiProfiles() }));
-  app.post<{ Body: AiProfileInput }>("/api/v1/ai-profiles", async (request, reply) => reply.code(201).send(await store.saveAiProfile(request.body)));
-  app.patch<{ Params: { id: string }; Body: Omit<AiProfileInput, "id"> }>("/api/v1/ai-profiles/:id", async (request) => store.saveAiProfile({ ...request.body, id: request.params.id }));
+  app.post<{ Body: AiProfileInput }>("/api/v1/ai-profiles", {
+    schema: { body: { type: "object", required: ["name", "baseUrl", "model"], additionalProperties: false, properties: profileProperties } },
+  }, async (request, reply) => reply.code(201).send(await store.saveAiProfile(request.body)));
+  app.patch<{ Params: { id: string }; Body: Partial<Omit<AiProfileInput, "id">> }>("/api/v1/ai-profiles/:id", {
+    schema: { body: { type: "object", minProperties: 1, additionalProperties: false, properties: profileProperties } },
+  }, async (request, reply) => {
+    const current = (await store.listAiProfiles()).find((profile) => profile.id === request.params.id);
+    if (!current) return notFound(reply, "Profile 不存在", request.url);
+    const { apiKeyConfigured: _configured, ...profile } = current;
+    return store.saveAiProfile({ ...profile, ...request.body, id: current.id });
+  });
   app.delete<{ Params: { id: string } }>("/api/v1/ai-profiles/:id", async (request) => { await store.deleteAiProfile(request.params.id); return { ok: true }; });
   app.patch<{ Body: Record<string, unknown> }>(
     "/api/v1/settings",
@@ -354,8 +401,8 @@ export async function createApp(store: Store, logger = true) {
             asyncBanMaxSeconds: { type: "integer", minimum: 1, maximum: 604800 },
             whitelistCidrs: { type: "array", maxItems: 5000, items: { type: "string", maxLength: 64 } },
             maliciousIpCidrs: { type: "array", maxItems: 5000, items: { type: "string", maxLength: 64 } },
-            waitRoomDefaults: { type: "object", additionalProperties: false, properties: { enabled: { type: "boolean" }, maxActive: { type: "integer", minimum: 1, maximum: 100000 }, maxQueue: { type: "integer", minimum: 0, maximum: 100000 }, timeoutSeconds: { type: "integer", minimum: 1, maximum: 86400 } } },
-            captcha: { type: "object", additionalProperties: false, properties: { enabled: { type: "boolean" }, provider: { type: "string", enum: ["local", "turnstile", "hcaptcha", "recaptcha"] }, siteKey: { type: "string", maxLength: 512 }, secret: { type: ["string", "null"], maxLength: 8192 } } },
+            waitRoomDefaults: waitRoomSchema,
+            captcha: { type: "object", additionalProperties: false, properties: { enabled: { type: "boolean" }, provider: { type: "string", enum: ["local", "turnstile", "hcaptcha", "recaptcha"] }, siteKey: { type: "string", maxLength: 512 }, secret: { type: ["string", "null"], maxLength: 8192 }, secretConfigured: { type: "boolean" }, timeoutMs: { type: "integer", minimum: 100, maximum: 30000 }, failureAction: { type: "string", enum: ["allow", "block"] }, trigger: { type: "string", enum: ["always", "cc"] } } },
           },
         },
       },
@@ -390,7 +437,8 @@ export async function createApp(store: Store, logger = true) {
       if (body.waitRoomDefaults !== undefined) nextSettings.waitRoomDefaults = body.waitRoomDefaults as NonNullable<Parameters<Store["updateSettings"]>[0]["waitRoomDefaults"]>;
       if (body.captcha !== undefined) {
         const captcha = body.captcha as Record<string, unknown>;
-        nextSettings.captcha = { ...store.getSettings().captcha, enabled: Boolean(captcha.enabled), provider: ["turnstile", "hcaptcha", "recaptcha"].includes(String(captcha.provider)) ? captcha.provider as "turnstile" | "hcaptcha" | "recaptcha" : "local", siteKey: typeof captcha.siteKey === "string" ? captcha.siteKey : "", ...(typeof captcha.secret === "string" ? { secretConfigured: captcha.secret.trim().length > 0 } : {}) };
+        const { secretConfigured: _configured, ...editable } = captcha;
+        nextSettings.captcha = { ...store.getSettings().captcha, ...editable } as NonNullable<Parameters<Store["updateSettings"]>[0]["captcha"]>;
       }
       if (
         nextSettings.customThreshold !== undefined &&
@@ -435,14 +483,16 @@ export async function createApp(store: Store, logger = true) {
 
   app.post("/api/v1/settings/test-jev", async () => {
     const settings = store.getSettings();
+    const selected = await store.getAiProvider();
     return classifyWithJev(
       JSON.stringify({ test: true, message: "JianFlow WAF connectivity test" }),
-      settings.model,
-      settings.aiTimeoutMs,
+      selected?.profile.model ?? settings.model,
+      selected?.profile.timeoutMs ?? settings.aiTimeoutMs, "management", selected?.provider,
     );
   });
 
   app.get("/api/v1/sites", async () => ({ data: store.listSites() }));
+  app.get("/api/v1/nginx/imports", async () => ({ data: store.listNginxImports() }));
   app.post<{ Body: { content: string } }>("/api/v1/nginx/import/preview", async (request, reply) => {
     if (typeof request.body?.content !== "string" || request.body.content.length > 1024 * 1024) {
       return reply.code(422).send({ type: "about:blank", title: "Validation error", status: 422, detail: "Nginx 配置必须是 1 MB 以内的文本" });
@@ -453,22 +503,21 @@ export async function createApp(store: Store, logger = true) {
     if (request.body?.confirm !== true) return reply.code(409).send({ type: "about:blank", title: "Confirmation required", status: 409, detail: "请先预览并确认导入" });
     const preview = previewNginxConfig(request.body.content);
     if (!preview.valid) return reply.code(422).send(preview);
-    const created: Site[] = [];
-    for (const imported of preview.sites) {
-      if (!imported.upstreamUrl) continue;
-      created.push(await store.saveSite({ name: imported.name, listenPort: imported.listenPort, upstreamUrl: imported.upstreamUrl, redirect: imported.redirect ?? null, mode: "traditional", enabled: true, operationMode: "defense", aiProfileId: null, policy: null, waitRoom: store.getSettings().waitRoomDefaults, maintenance: { source: "default", statusCode: 503 }, upstreamError: { source: "default", statusCode: 502 } }));
-    }
-    return { imported: created.length, data: created, skipped: preview.sites.length - created.length };
+    const created = await store.importSites(preview.sites.map((imported) => ({ name: imported.name, listenPort: imported.listenPort, upstreamUrl: imported.upstreamUrl ?? imported.redirect!.location, upstreamPool: imported.upstreamPool ?? [], redirect: imported.redirect ?? null, mode: "traditional", enabled: true, operationMode: "defense", aiProfileId: null, policy: null, waitRoom: store.getSettings().waitRoomDefaults, maintenance: { source: "default", statusCode: 503 }, upstreamError: { source: "default", statusCode: 502 } })), createHash("sha256").update(request.body.content).digest("hex"));
+    return { imported: created.length, data: created, skipped: 0 };
   });
   app.post<{
     Body: {
       name?: string;
       listenPort?: number;
       upstreamUrl?: string;
+      upstreamPool?: Array<{ url: string; weight?: number }>;
       redirect?: { statusCode: 301 | 302; location: string } | null;
       mode?: ProtectionMode;
       operationMode?: "defense" | "record" | "maintenance";
       aiProfileId?: string | null;
+      auditMode?: "sync" | "async" | null;
+      captchaEnabled?: boolean | null;
       enabled?: boolean;
       policy?: SitePolicy | null;
       waitRoom?: { enabled: boolean; maxActive: number; maxQueue: number; timeoutSeconds: number };
@@ -485,15 +534,18 @@ export async function createApp(store: Store, logger = true) {
           name: { type: "string", minLength: 1, maxLength: 256 },
           listenPort: { type: "integer", minimum: config.sitePortRange.min, maximum: config.sitePortRange.max },
           upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
+          upstreamPool: { type: "array", maxItems: 32, items: { type: "object", required: ["url"], additionalProperties: false, properties: { url: { type: "string", minLength: 1, maxLength: 2048 }, weight: { type: "integer", minimum: 1, maximum: 1000 } } } },
           redirect: { anyOf: [{ type: "null" }, { type: "object", required: ["statusCode", "location"], additionalProperties: false, properties: { statusCode: { type: "integer", enum: [301, 302] }, location: { type: "string", minLength: 1, maxLength: 2048 } } }] },
           mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
           operationMode: { type: "string", enum: ["defense", "record", "maintenance"] },
           aiProfileId: { type: ["string", "null"], maxLength: 128 },
+          auditMode: { type: ["string", "null"], enum: ["sync", "async", null] },
+          captchaEnabled: { type: ["boolean", "null"] },
           enabled: { type: "boolean" },
           policy: { anyOf: [policySchema, { type: "null" }] },
-          waitRoom: { type: "object", additionalProperties: false },
-          maintenance: { type: "object", additionalProperties: false },
-          upstreamError: { type: "object", additionalProperties: false }
+          waitRoom: waitRoomSchema,
+          maintenance: pageSchema,
+          upstreamError: pageSchema
         }
       }
     }
@@ -510,10 +562,13 @@ export async function createApp(store: Store, logger = true) {
       name: body.name,
       listenPort: body.listenPort,
       upstreamUrl: body.upstreamUrl,
+      upstreamPool: body.upstreamPool ?? [],
       redirect: body.redirect ?? null,
       mode: body.mode ?? "hybrid",
       operationMode: body.operationMode ?? "defense",
       aiProfileId: body.aiProfileId ?? null,
+      auditMode: body.auditMode ?? null,
+      captchaEnabled: body.captchaEnabled ?? null,
       enabled: body.enabled ?? true,
       ...(body.policy === undefined ? {} : { policy: body.policy }),
       ...(body.waitRoom === undefined ? {} : { waitRoom: body.waitRoom }),
@@ -528,10 +583,13 @@ export async function createApp(store: Store, logger = true) {
       name?: string;
       listenPort?: number;
       upstreamUrl?: string;
+      upstreamPool?: Array<{ url: string; weight?: number }>;
       redirect?: { statusCode: 301 | 302; location: string } | null;
       mode?: ProtectionMode;
       operationMode?: "defense" | "record" | "maintenance";
       aiProfileId?: string | null;
+      auditMode?: "sync" | "async" | null;
+      captchaEnabled?: boolean | null;
       enabled?: boolean;
       policy?: SitePolicy | null;
       waitRoom?: { enabled: boolean; maxActive: number; maxQueue: number; timeoutSeconds: number };
@@ -548,15 +606,18 @@ export async function createApp(store: Store, logger = true) {
           name: { type: "string", minLength: 1, maxLength: 256 },
           listenPort: { type: "integer", minimum: config.sitePortRange.min, maximum: config.sitePortRange.max },
           upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
+          upstreamPool: { type: "array", maxItems: 32, items: { type: "object", required: ["url"], additionalProperties: false, properties: { url: { type: "string", minLength: 1, maxLength: 2048 }, weight: { type: "integer", minimum: 1, maximum: 1000 } } } },
           redirect: { anyOf: [{ type: "null" }, { type: "object", required: ["statusCode", "location"], additionalProperties: false, properties: { statusCode: { type: "integer", enum: [301, 302] }, location: { type: "string", minLength: 1, maxLength: 2048 } } }] },
           mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
           operationMode: { type: "string", enum: ["defense", "record", "maintenance"] },
           aiProfileId: { type: ["string", "null"], maxLength: 128 },
+          auditMode: { type: ["string", "null"], enum: ["sync", "async", null] },
+          captchaEnabled: { type: ["boolean", "null"] },
           enabled: { type: "boolean" },
           policy: { anyOf: [policySchema, { type: "null" }] },
-          waitRoom: { type: "object", additionalProperties: false },
-          maintenance: { type: "object", additionalProperties: false },
-          upstreamError: { type: "object", additionalProperties: false }
+          waitRoom: waitRoomSchema,
+          maintenance: pageSchema,
+          upstreamError: pageSchema
         }
       }
     }
