@@ -47,6 +47,13 @@ test("management setup, production HTTP login, validation and private key respon
     payload: { name: "Orders", listenPort: 8081, upstreamUrl: "http://127.0.0.1:9101", mode: "hybrid", enabled: true } });
   assert.equal(site.statusCode, 201);
   assert.equal(site.json().listenPort, 8081);
+  const nginxContent = "server { listen 8082; server_name imported.example; location / { proxy_pass http://127.0.0.1:9104; } }";
+  const nginxPreview = await app.inject({ method: "POST", url: "/api/v1/nginx/import/preview", headers: { cookie }, payload: { content: nginxContent } });
+  assert.equal(nginxPreview.statusCode, 200);
+  assert.equal(nginxPreview.json().valid, true);
+  const nginxImport = await app.inject({ method: "POST", url: "/api/v1/nginx/import", headers: { cookie }, payload: { content: nginxContent, confirm: true } });
+  assert.equal(nginxImport.statusCode, 200);
+  assert.equal(nginxImport.json().imported, 1);
   const editedSite = await app.inject({ method: "PATCH", url: `/api/v1/sites/${site.json().id}`, headers: { cookie },
     payload: { upstreamUrl: "http://127.0.0.1:9102" } });
   assert.equal(editedSite.statusCode, 200);

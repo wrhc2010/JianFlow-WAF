@@ -255,6 +255,24 @@ test("dynamic traffic bans reject later requests", { timeout: 5000 }, async (t) 
   assert.equal(trafficRuntime(store).concurrent, 0);
 });
 
+test("site redirect returns the configured status and location", { timeout: 5000 }, async (t) => {
+  const store = {
+    getSettings: () => ({ mode: "traditional", strength: "medium", customThreshold: 0.5, model: "test", aiTimeoutMs: 100, aiBodyLimit: 32768, upstreamUrl: "http://127.0.0.1:9", whitelistCidrs: [], maliciousIpCidrs: [] }),
+    getSiteByPort: () => ({ id: "redirect", name: "Redirect", listenPort: 8081, upstreamUrl: "http://127.0.0.1:9", redirect: { statusCode: 302, location: "https://example.com/login" }, mode: "traditional", enabled: true, createdAt: "" }),
+    listRules: () => BUILTIN_RULES,
+    saveEvent: async () => {}
+  } as unknown as Store;
+  const proxy = createProxyServer(store, 8081);
+  const port = await listen(proxy);
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); });
+  const result = await new Promise<{ status: number; location?: string }>((resolve, reject) => {
+    const request = http.get({ host: "127.0.0.1", port, path: "/" }, (response) => { response.resume(); response.on("end", () => resolve({ status: response.statusCode!, location: response.headers.location })); });
+    request.on("error", reject);
+  });
+  assert.equal(result.status, 302);
+  assert.equal(result.location, "https://example.com/login");
+});
+
 test("disabling a listener closes upgraded WebSocket connections without hanging", { timeout: 5000 }, async (t) => {
   const upstreamSockets = new Set<import("node:stream").Duplex>();
   const upstream = http.createServer();

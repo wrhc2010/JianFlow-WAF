@@ -18,6 +18,7 @@ import {
 import { config } from "./config.js";
 import { parseRuleImport, RuleImportError, validateRule } from "./rule-import.js";
 import { Store, type EventFilters } from "./db/store.js";
+import { previewNginxConfig } from "./nginx-import.js";
 import { classifyWithJev } from "./jev.js";
 import { ConflictError, SetupConflictError, ValidationError } from "./errors.js";
 import { policySchema, parsePolicy } from "./policy-validation.js";
@@ -413,11 +414,29 @@ export async function createApp(store: Store, logger = true) {
   });
 
   app.get("/api/v1/sites", async () => ({ data: store.listSites() }));
+  app.post<{ Body: { content: string } }>("/api/v1/nginx/import/preview", async (request, reply) => {
+    if (typeof request.body?.content !== "string" || request.body.content.length > 1024 * 1024) {
+      return reply.code(422).send({ type: "about:blank", title: "Validation error", status: 422, detail: "Nginx 配置必须是 1 MB 以内的文本" });
+    }
+    return previewNginxConfig(request.body.content);
+  });
+  app.post<{ Body: { content: string; confirm?: boolean } }>("/api/v1/nginx/import", async (request, reply) => {
+    if (request.body?.confirm !== true) return reply.code(409).send({ type: "about:blank", title: "Confirmation required", status: 409, detail: "请先预览并确认导入" });
+    const preview = previewNginxConfig(request.body.content);
+    if (!preview.valid) return reply.code(422).send(preview);
+    const created: Site[] = [];
+    for (const imported of preview.sites) {
+      if (!imported.upstreamUrl) continue;
+      created.push(await store.saveSite({ name: imported.name, listenPort: imported.listenPort, upstreamUrl: imported.upstreamUrl, redirect: imported.redirect ?? null, mode: "traditional", enabled: true, operationMode: "defense", aiProfileId: null, policy: null, waitRoom: store.getSettings().waitRoomDefaults, maintenance: { source: "default", statusCode: 503 }, upstreamError: { source: "default", statusCode: 502 } }));
+    }
+    return { imported: created.length, data: created, skipped: preview.sites.length - created.length };
+  });
   app.post<{
     Body: {
       name?: string;
       listenPort?: number;
       upstreamUrl?: string;
+      redirect?: { statusCode: 301 | 302; location: string } | null;
       mode?: ProtectionMode;
       operationMode?: "defense" | "record" | "maintenance";
       aiProfileId?: string | null;
@@ -437,6 +456,7 @@ export async function createApp(store: Store, logger = true) {
           name: { type: "string", minLength: 1, maxLength: 256 },
           listenPort: { type: "integer", minimum: config.sitePortRange.min, maximum: config.sitePortRange.max },
           upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
+          redirect: { anyOf: [{ type: "null" }, { type: "object", required: ["statusCode", "location"], additionalProperties: false, properties: { statusCode: { type: "integer", enum: [301, 302] }, location: { type: "string", minLength: 1, maxLength: 2048 } } }] },
           mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
           operationMode: { type: "string", enum: ["defense", "record", "maintenance"] },
           aiProfileId: { type: ["string", "null"], maxLength: 128 },
@@ -461,6 +481,7 @@ export async function createApp(store: Store, logger = true) {
       name: body.name,
       listenPort: body.listenPort,
       upstreamUrl: body.upstreamUrl,
+      redirect: body.redirect ?? null,
       mode: body.mode ?? "hybrid",
       operationMode: body.operationMode ?? "defense",
       aiProfileId: body.aiProfileId ?? null,
@@ -478,6 +499,7 @@ export async function createApp(store: Store, logger = true) {
       name?: string;
       listenPort?: number;
       upstreamUrl?: string;
+      redirect?: { statusCode: 301 | 302; location: string } | null;
       mode?: ProtectionMode;
       operationMode?: "defense" | "record" | "maintenance";
       aiProfileId?: string | null;
@@ -497,6 +519,7 @@ export async function createApp(store: Store, logger = true) {
           name: { type: "string", minLength: 1, maxLength: 256 },
           listenPort: { type: "integer", minimum: config.sitePortRange.min, maximum: config.sitePortRange.max },
           upstreamUrl: { type: "string", minLength: 1, maxLength: 2048 },
+          redirect: { anyOf: [{ type: "null" }, { type: "object", required: ["statusCode", "location"], additionalProperties: false, properties: { statusCode: { type: "integer", enum: [301, 302] }, location: { type: "string", minLength: 1, maxLength: 2048 } } }] },
           mode: { type: "string", enum: ["ai", "traditional", "hybrid"] },
           operationMode: { type: "string", enum: ["defense", "record", "maintenance"] },
           aiProfileId: { type: ["string", "null"], maxLength: 128 },

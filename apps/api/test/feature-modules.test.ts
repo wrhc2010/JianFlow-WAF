@@ -21,6 +21,19 @@ test("previews the safe nginx subset and rejects unknown directives", () => {
   assert.match(rejected.errors.join("\n"), /lua_code_cache/);
 });
 
+test("nginx preview keeps imports behind explicit confirmation", async () => {
+  const { createApp } = await import("../src/app.js");
+  const store = {
+    setupStatus: () => ({ initialized: false }),
+    listSites: () => [],
+    getSettings: () => ({ waitRoomDefaults: { enabled: false, maxActive: 100, maxQueue: 100, timeoutSeconds: 60 } })
+  } as never;
+  const app = await createApp(store, false);
+  const preview = await app.inject({ method: "POST", url: "/api/v1/nginx/import/preview", payload: { content: "server { listen 8081; location / { proxy_pass http://127.0.0.1:9001; } }" } });
+  assert.equal(preview.statusCode, 428);
+  await app.close();
+});
+
 test("wait room grants active requests FIFO and rejects a full queue", async () => {
   const room = new WaitRoom({ enabled: true, maxActive: 1, maxQueue: 1, timeoutSeconds: 1 });
   const first = await room.enter();

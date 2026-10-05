@@ -31,6 +31,7 @@ export type Site = {
   name: string;
   listenPort: number;
   upstreamUrl: string;
+  redirect?: { statusCode: 301 | 302; location: string } | null;
   mode: ProtectionMode;
   enabled: boolean;
   createdAt: string;
@@ -225,6 +226,7 @@ export class Store {
       name: "默认站点",
       listenPort: config.proxyPort,
       upstreamUrl: this.settings.upstreamUrl,
+      redirect: null,
       mode: this.settings.mode,
       enabled: true,
       createdAt: new Date().toISOString()
@@ -621,9 +623,9 @@ export class Store {
         for (const site of sites) {
           await client.query(
             `UPDATE sites SET upstream_url = $1, mode = $2, revision = $4, operation_mode = $5,
-             ai_profile_id = $6, wait_room = $7::jsonb, maintenance = $8::jsonb, upstream_error = $9::jsonb WHERE id = $3`,
+             ai_profile_id = $6, wait_room = $7::jsonb, maintenance = $8::jsonb, upstream_error = $9::jsonb, redirect = $10::jsonb WHERE id = $3`,
             [site.upstreamUrl, site.mode, site.id, site.revision, site.operationMode, site.aiProfileId,
-              JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError)]
+              JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError), site.redirect ? JSON.stringify(site.redirect) : null]
           );
         }
         await client.query("COMMIT");
@@ -734,6 +736,7 @@ export class Store {
         name: input.name,
         listenPort,
         upstreamUrl: input.upstreamUrl,
+        redirect: input.redirect ?? current?.redirect ?? null,
         mode: effectiveProtectionMode(input.mode, Boolean(config.openRouterKey)),
         enabled: input.enabled,
         createdAt: current?.createdAt ?? new Date().toISOString(),
@@ -754,15 +757,15 @@ export class Store {
           await client.query("BEGIN");
           await client.query(
             `INSERT INTO sites (id, name, listen_port, upstream_url, mode, enabled, policy, revision, created_at,
-             operation_mode, ai_profile_id, wait_room, maintenance, upstream_error)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb)
+             operation_mode, ai_profile_id, wait_room, maintenance, upstream_error, redirect)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb)
              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, listen_port = EXCLUDED.listen_port,
              upstream_url = EXCLUDED.upstream_url, mode = EXCLUDED.mode, enabled = EXCLUDED.enabled,
              policy = EXCLUDED.policy, revision = EXCLUDED.revision, operation_mode = EXCLUDED.operation_mode,
              ai_profile_id = EXCLUDED.ai_profile_id, wait_room = EXCLUDED.wait_room,
-             maintenance = EXCLUDED.maintenance, upstream_error = EXCLUDED.upstream_error`,
+             maintenance = EXCLUDED.maintenance, upstream_error = EXCLUDED.upstream_error, redirect = EXCLUDED.redirect`,
             [site.id, site.name, site.listenPort, site.upstreamUrl, site.mode, site.enabled, site.policy ? JSON.stringify(site.policy) : null, site.revision, site.createdAt,
-              site.operationMode, site.aiProfileId, JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError)]
+              site.operationMode, site.aiProfileId, JSON.stringify(site.waitRoom), JSON.stringify(site.maintenance), JSON.stringify(site.upstreamError), site.redirect ? JSON.stringify(site.redirect) : null]
           );
           if (site.id === "default") {
             await client.query(
@@ -1260,6 +1263,10 @@ function validateSite(site: Omit<Site, "createdAt" | "id"> & { id?: string }): v
   if (typeof site.enabled !== "boolean") throw new ValidationError("站点启用状态无效");
   if (!["defense", "record", "maintenance"].includes(site.operationMode ?? "defense")) throw new ValidationError("站点运行模式无效");
   validateHttpEndpoint(site.upstreamUrl, "上游地址");
+  if (site.redirect !== undefined && site.redirect !== null) {
+    if (site.redirect.statusCode !== 301 && site.redirect.statusCode !== 302) throw new ValidationError("跳转状态码必须是 301 或 302");
+    validateHttpEndpoint(site.redirect.location, "跳转地址");
+  }
 }
 
 function validateHttpEndpoint(value: string, label: string): void {
@@ -1397,8 +1404,20 @@ function mapSite(row: QueryResultRow): Site {
     aiProfileId: row.ai_profile_id ? String(row.ai_profile_id) : null,
     waitRoom: parseWaitRoom(row.wait_room),
     maintenance: parsePageConfig(row.maintenance, 503),
-    upstreamError: parsePageConfig(row.upstream_error, 502)
+    upstreamError: parsePageConfig(row.upstream_error, 502),
+    redirect: parseRedirect(row.redirect) ?? null
   };
+}
+
+function parseRedirect(value: unknown): Site["redirect"] {
+  if (!value || typeof value !== "object") return null;
+  const source = value as { statusCode?: unknown; location?: unknown };
+  if ((source.statusCode !== 301 && source.statusCode !== 302) || typeof source.location !== "string" || !source.location.trim()) return null;
+  try {
+    const target = new URL(source.location);
+    if (target.protocol !== "http:" && target.protocol !== "https:") return null;
+  } catch { return null; }
+  return { statusCode: source.statusCode, location: source.location.trim() };
 }
 
 function isSitePort(value: unknown): value is number {

@@ -82,6 +82,7 @@ ALTER TABLE sites ADD COLUMN IF NOT EXISTS ai_profile_id TEXT;
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS wait_room JSONB NOT NULL DEFAULT '{"enabled":false,"maxActive":100,"maxQueue":100,"timeoutSeconds":60}'::jsonb;
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS maintenance JSONB NOT NULL DEFAULT '{"source":"default","statusCode":503}'::jsonb;
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS upstream_error JSONB NOT NULL DEFAULT '{"source":"default","statusCode":502}'::jsonb;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS redirect JSONB;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS api_key_ciphertext TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_salt TEXT;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS admin_password_hash TEXT;

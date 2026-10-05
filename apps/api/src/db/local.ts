@@ -15,7 +15,7 @@ export type LocalState = {
   rules: WafRule[];
   builtinRuleIds?: string[] | undefined;
   scopedRules?: Array<RuleException | AccessRule>;
-  sites: Array<{ id: string; name: string; listenPort: number; upstreamUrl: string; mode: ProtectionMode; enabled: boolean; createdAt: string; policy?: SitePolicy | null; revision?: number; operationMode?: "defense" | "record" | "maintenance"; aiProfileId?: string | null; waitRoom?: WaitRoomConfig; maintenance?: PageConfig; upstreamError?: PageConfig }>;
+  sites: Array<{ id: string; name: string; listenPort: number; upstreamUrl: string; redirect?: { statusCode: 301 | 302; location: string } | null; mode: ProtectionMode; enabled: boolean; createdAt: string; policy?: SitePolicy | null; revision?: number; operationMode?: "defense" | "record" | "maintenance"; aiProfileId?: string | null; waitRoom?: WaitRoomConfig; maintenance?: PageConfig; upstreamError?: PageConfig }>;
 };
 
 export class LocalDatabase {

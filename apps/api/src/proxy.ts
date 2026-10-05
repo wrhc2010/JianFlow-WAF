@@ -410,6 +410,14 @@ async function handleProxyRequest(store: Store, request: http.IncomingMessage, r
       await saveOnce(decision, site.maintenance?.statusCode ?? 503);
       return;
     }
+    if (site?.redirect) {
+      decision = { action: "allow", mode: settings.mode, requestId, matchedRules: [], reason: "站点跳转", module: "redirect", localInspectionComplete: true };
+      request.resume();
+      response.writeHead(site.redirect.statusCode, { location: site.redirect.location, "x-jev-request-id": requestId });
+      response.end();
+      await saveOnce(decision, site.redirect.statusCode);
+      return;
+    }
     const roomAdmission = site ? await waitRoom(store, site).enter() : { allowed: true, queued: false, release: () => {} };
     if (!roomAdmission.allowed) {
       decision = { action: "block", mode: settings.mode, requestId, matchedRules: [], reason: roomAdmission.reason ?? "等候室拒绝", module: "wait-room", localInspectionComplete: false };
